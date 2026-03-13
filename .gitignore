@@ -1,0 +1,9 @@
+# Node modules
+OEM-script/node_modules/
+vin-lookup-ui/node_modules/
+
+# Environment files
+OEM-script/.env
+OEM-script/.env.*
+vin-lookup-ui/.env
+vin-lookup-ui/.env.*
