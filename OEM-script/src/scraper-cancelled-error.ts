@@ -5,3 +5,11 @@ export class ScraperCancelledError extends Error {
     this.name = 'ScraperCancelledError';
   }
 }
+
+/** Thrown when active scraping exceeds the allowed time (not while awaiting user selection). */
+export class ScraperTimeoutError extends Error {
+  constructor() {
+    super('Scraper exceeded the allowed time.');
+    this.name = 'ScraperTimeoutError';
+  }
+}

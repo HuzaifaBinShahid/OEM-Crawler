@@ -1,9 +1,12 @@
 import "dotenv/config";
+import http from "node:http";
+import type { IncomingMessage } from "node:http";
+import { WebSocketServer, type WebSocket } from "ws";
 import cors from "cors";
 import express from "express";
 import { createJob, resolveSelection } from "./job-store.js";
 import { registerJobCancel, abortJob, clearJobCancel } from "./job-cancel.js";
-import { ScraperCancelledError } from "./scraper-cancelled-error.js";
+import { ScraperCancelledError, ScraperTimeoutError } from "./scraper-cancelled-error.js";
 import { loadConfig } from "./config.js";
 import { connectDb, disconnectDb } from "./db/connection.js";
 import { findVinLookup, saveVinLookup } from "./db/vin-lookup-repo.js";
@@ -13,6 +16,8 @@ import { logScraperError } from "./services/error-handler.js";
 
 /** Generic message shown to client on error; exact error is only written to log files. */
 const GENERIC_ERROR_MESSAGE = "An error occurred. Please try again later.";
+/** Max time for active scraping in stream mode (ms). Not applied while awaiting user selection. */
+const STREAM_SCRAPER_TIMEOUT_MS = 60000;
 
 function apiResponse<T>(
   res: express.Response,
@@ -224,6 +229,7 @@ app.post("/api/vin-lookup/stream/select", (req, res) => {
     }
     const ok = resolveSelection(jobId, { selections });
     if (!ok) {
+      console.warn("[api] stream/select: job not found or already resolved, jobId=", jobId);
       res.status(404).json({ data: null, message: "Job not found or already resolved", error: null });
       return;
     }
@@ -236,6 +242,7 @@ app.post("/api/vin-lookup/stream/select", (req, res) => {
   }
   const ok = resolveSelection(jobId, { selectedPart, partIndex });
   if (!ok) {
+    console.warn("[api] stream/select: job not found or already resolved, jobId=", jobId);
     res.status(404).json({ data: null, message: "Job not found or already resolved", error: null });
     return;
   }
@@ -311,6 +318,9 @@ app.get("/api/vin-lookup/stream", async (req, res) => {
   function sendEvent(type: "status" | "result" | "error" | "awaiting_selection", payload: unknown): void {
     const line = JSON.stringify({ type, ...(typeof payload === "object" && payload !== null ? payload : { data: payload }) });
     res.write(`data: ${line}\n\n`);
+    if (typeof (res as NodeJS.WritableStream & { flush?: () => void }).flush === "function") {
+      (res as NodeJS.WritableStream & { flush: () => void }).flush();
+    }
   }
 
   try {
@@ -385,6 +395,7 @@ app.get("/api/vin-lookup/stream", async (req, res) => {
       onStatus,
       jobId,
       abortSignal,
+      scraperTimeoutMs: STREAM_SCRAPER_TIMEOUT_MS,
       onAwaitingSelection:
         jobId !== undefined
           ? (payload) => {
@@ -422,35 +433,169 @@ app.get("/api/vin-lookup/stream", async (req, res) => {
     sendEvent("result", { data: result });
   } catch (err) {
     if (err instanceof ScraperCancelledError) {
-      sendEvent("error", { message: "Process was stopped." });
+      try {
+        sendEvent("error", { message: "Process was stopped." });
+      } catch {
+        // ignore: client may have disconnected
+      }
       return;
     }
-    console.error("[api] stream scraper error:", err);
-    const config = loadConfig();
-    await logScraperError(err, {
-      step: "api-stream-scraper",
-      vin,
-      cartName,
-      skuQuery,
-      screenshotsDir: config.screenshotsDir,
-      logsDir: config.logsDir,
-    });
-    sendEvent("error", { message: GENERIC_ERROR_MESSAGE });
+
+    const clientMessage = getStreamErrorMessage(err);
+    try {
+      sendEvent("error", { message: clientMessage });
+    } catch {
+      // ignore: if the connection is already closed, the frontend will surface a network error
+    }
+
+    if (!(err instanceof ScraperCancelledError) && !(err instanceof ScraperTimeoutError)) {
+      console.error("[api] stream scraper error:", err);
+      try {
+        const config = loadConfig();
+        await logScraperError(err, {
+          step: "api-stream-scraper",
+          vin,
+          cartName,
+          skuQuery,
+          screenshotsDir: config.screenshotsDir,
+          logsDir: config.logsDir,
+        });
+      } catch (logErr) {
+        console.error("[api] failed to log stream scraper error:", logErr);
+      }
+    }
   } finally {
     if (jobId) clearJobCancel(jobId);
     res.end();
   }
 });
 
+function getStreamErrorMessage(err: unknown): string {
+  if (err instanceof ScraperCancelledError) return "Process was stopped.";
+  if (err instanceof ScraperTimeoutError) return "Request timed out. Please try again.";
+  const errMessage = err instanceof Error ? err.message : String(err);
+  const isBrowserClosed =
+    /target page, context or browser has been closed/i.test(errMessage) ||
+    /browser has been closed/i.test(errMessage);
+  return isBrowserClosed ? "The search was interrupted. Please try again." : GENERIC_ERROR_MESSAGE;
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   await connectDb();
-  app.listen(config.apiPort, () => {
+
+  const server = http.createServer(app);
+
+  const wss = new WebSocketServer({ server, path: "/api/vin-lookup/ws" });
+  wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
+    const url = new URL(req.url ?? "", `http://${req.headers.host ?? "localhost"}`);
+    const vin = (url.searchParams.get("vin") ?? "").trim();
+    const cartName = (url.searchParams.get("cartName") ?? "").trim() || "default-cart";
+    const skuQuery = (url.searchParams.get("skuQuery") ?? "").trim() || undefined;
+
+    const send = (obj: object) => {
+      try {
+        if (ws.readyState === 1) ws.send(JSON.stringify(obj));
+      } catch {
+        // ignore
+      }
+    };
+
+    if (!vin) {
+      send({ type: "error", message: "Missing required query: vin" });
+      ws.close();
+      return;
+    }
+
+    try {
+      const cached = await findVinLookup({ vin, cartName, skuQuery });
+      if (cached) {
+        if (skuQuery && !cached.found && (!cached.parts || cached.parts.length === 0)) {
+          send({ type: "error", message: "Part was not found in the detail list for the given query." });
+          ws.close();
+          return;
+        }
+        send({ type: "status", message: "Loaded from cache." });
+        send({ type: "result", data: { ...cached, cached: true } });
+        ws.close();
+        return;
+      }
+    } catch (err) {
+      console.error("[api] ws DB find error:", err);
+      send({ type: "error", message: GENERIC_ERROR_MESSAGE });
+      ws.close();
+      return;
+    }
+
+    let jobId: string | undefined;
+    let selectionPromise: ReturnType<typeof createJob>["promise"] | undefined;
+    let abortSignal: AbortSignal | undefined;
+    if (skuQuery) {
+      const job = createJob();
+      jobId = job.jobId;
+      selectionPromise = job.promise;
+      abortSignal = registerJobCancel(jobId);
+    }
+
+    try {
+      const result = await runVinLookup({
+        vin,
+        cartName,
+        skuQuery,
+        onStatus: (message) => send({ type: "status", message }),
+        jobId,
+        abortSignal,
+        scraperTimeoutMs: STREAM_SCRAPER_TIMEOUT_MS,
+        onAwaitingSelection:
+          jobId !== undefined
+            ? (payload) => send({ type: "awaiting_selection", jobId, parts: payload.parts, suggestedPart: payload.suggestedPart, partsPerTerm: payload.partsPerTerm })
+            : undefined,
+        waitForSelection: selectionPromise ? () => selectionPromise! : undefined,
+      });
+
+      if (result.cancelled) {
+        send({ type: "error", message: "Process was stopped." });
+        ws.close();
+        return;
+      }
+      if (skuQuery && !result.found && (!result.parts || result.parts.length === 0)) {
+        const errorMsg = result.noMatch ? "No matches found for this record." : "Part was not found in the detail list for the given query.";
+        send({ type: "error", message: errorMsg });
+        ws.close();
+        return;
+      }
+      if (skuQuery && result.found) {
+        await saveVinLookup({ vin, cartName, skuQuery }, result);
+      }
+      send({ type: "result", data: result });
+      ws.close();
+    } catch (err) {
+      const clientMessage = getStreamErrorMessage(err);
+      send({ type: "error", message: clientMessage });
+      console.error("[api] ws scraper error:", err);
+      try {
+        await logScraperError(err, {
+          step: "api-ws-scraper",
+          vin,
+          cartName,
+          skuQuery,
+          screenshotsDir: config.screenshotsDir,
+          logsDir: config.logsDir,
+        });
+      } catch (logErr) {
+        console.error("[api] failed to log ws scraper error:", logErr);
+      }
+      ws.close();
+    } finally {
+      if (jobId) clearJobCancel(jobId);
+    }
+  });
+
+  server.listen(config.apiPort, () => {
     console.log(`API listening on http://localhost:${config.apiPort}`);
-    console.log(
-      "  GET  /api/vin-lookup?vin=...&cartName=...&skuQuery=...",
-    );
+    console.log("  GET  /api/vin-lookup?vin=...&cartName=...&skuQuery=...");
     console.log("  GET  /api/vin-lookup/stream?vin=... (SSE with live status)");
+    console.log("  WS   /api/vin-lookup/ws?vin=...&cartName=...&skuQuery=... (preferred for live status + errors)");
     console.log("  POST /api/vin-lookup with JSON { vin, cartName?, skuQuery? }");
   });
 }

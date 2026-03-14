@@ -13,7 +13,7 @@ import { login } from './steps/login.js';
 import { goToPartSearch } from './steps/navigation.js';
 import { submitVinSearch } from './steps/vin-form.js';
 import { logScraperError } from './services/error-handler.js';
-import { ScraperCancelledError } from './scraper-cancelled-error.js';
+import { ScraperCancelledError, ScraperTimeoutError } from './scraper-cancelled-error.js';
 
 function stripQuantityForSearch(term: string): string {
   const t = term.trim();
@@ -34,11 +34,14 @@ export interface RunVinLookupOptions {
   jobId?: string;
   /** When aborted (e.g. user clicked Stop during detail list), scraper should throw ScraperCancelledError. */
   abortSignal?: AbortSignal;
+  /** Max ms for active scraping (navigation, search, detail list). Not applied while awaiting user selection. */
+  scraperTimeoutMs?: number;
   onAwaitingSelection?: (payload: { parts?: VinLookupResult['parts']; suggestedPart?: { sku: string }; partsPerTerm?: Array<{ term: string; parts: VinLookupResult['parts']; suggestedPart?: { sku: string } }> }) => void;
   waitForSelection?: () => Promise<SelectionOutcome>;
 }
 
-function throwIfAborted(abortSignal?: AbortSignal): void {
+function throwIfAborted(abortSignal?: AbortSignal, workTimeoutAborted?: boolean): void {
+  if (workTimeoutAborted) throw new ScraperTimeoutError();
   if (abortSignal?.aborted) throw new ScraperCancelledError();
 }
 
@@ -96,7 +99,22 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
   let currentPage: Page = page;
   let lastStep = 'init';
 
+  let workTimeoutId: ReturnType<typeof setTimeout> | null = null;
+  let workTimeoutController: AbortController | null = null;
+  function disarmWorkTimeout(): void {
+    if (workTimeoutId) clearTimeout(workTimeoutId);
+    workTimeoutId = null;
+    workTimeoutController = null;
+  }
+  function armWorkTimeout(): void {
+    disarmWorkTimeout();
+    if (!options.scraperTimeoutMs) return;
+    workTimeoutController = new AbortController();
+    workTimeoutId = setTimeout(() => workTimeoutController!.abort(), options.scraperTimeoutMs);
+  }
+
   try {
+    armWorkTimeout();
     lastStep = 'navigation';
     status('Navigating to portal...');
     if (hasStoredState) {
@@ -174,7 +192,9 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
 
         if (options.waitForSelection) {
           options.onAwaitingSelection?.({ partsPerTerm });
+          disarmWorkTimeout();
           const selection = await options.waitForSelection();
+          armWorkTimeout();
           if ('stop' in selection && selection.stop) {
             result.cancelled = true;
             result.responseTimeMs = Date.now() - start;
@@ -184,7 +204,7 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
           if ('selections' in selection && Array.isArray(selection.selections) && selection.selections.length > 0) {
             lastStep = 'openDetailList';
             status('Opening detail list...');
-            throwIfAborted(options.abortSignal);
+            throwIfAborted(options.abortSignal, workTimeoutController?.signal.aborted);
             await openDetailList(targetPage);
             lastStep = 'extractBuildSheet';
             status('Extracting build sheet...');
@@ -209,7 +229,7 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
                 status('Could not resolve category from catalog API; using AI to pick category.');
               }
               status(`Searching for selected part ${i + 1} in detail list...`);
-              throwIfAborted(options.abortSignal);
+              throwIfAborted(options.abortSignal, workTimeoutController?.signal.aborted);
               const match = await findPartInDetailListByDescription(
                 targetPage,
                 {
@@ -238,7 +258,7 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
           const selectedPart = selection.selectedPart;
           lastStep = 'openDetailList';
           status('Opening detail list...');
-          throwIfAborted(options.abortSignal);
+          throwIfAborted(options.abortSignal, workTimeoutController?.signal.aborted);
           await openDetailList(targetPage);
           lastStep = 'extractBuildSheet';
           status('Extracting build sheet...');
@@ -259,7 +279,7 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
             status('Could not resolve category from catalog API; using AI to pick category.');
           }
           status('Searching for selected part in detail list...');
-          throwIfAborted(options.abortSignal);
+          throwIfAborted(options.abortSignal, workTimeoutController?.signal.aborted);
           const match = await findPartInDetailListByDescription(
             targetPage,
             {
@@ -339,7 +359,9 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
         if (suggestedSku) suggestedPart = { sku: suggestedSku };
       }
       options.onAwaitingSelection?.({ parts: searchParts, suggestedPart });
+      disarmWorkTimeout();
       const selection = await options.waitForSelection();
+      armWorkTimeout();
       if ('stop' in selection && selection.stop) {
         result.cancelled = true;
         result.responseTimeMs = Date.now() - start;
@@ -351,7 +373,7 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
       const selectedPart = selection.selectedPart;
       lastStep = 'openDetailList';
       status('Opening detail list...');
-      throwIfAborted(options.abortSignal);
+      throwIfAborted(options.abortSignal, workTimeoutController?.signal.aborted);
       await openDetailList(targetPage);
       lastStep = 'extractBuildSheet';
       status('Extracting build sheet...');
@@ -374,7 +396,7 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
         status('Could not resolve category from catalog API; using AI to pick category.');
       }
       status('Searching for selected part in detail list...');
-      throwIfAborted(options.abortSignal);
+      throwIfAborted(options.abortSignal, workTimeoutController?.signal.aborted);
       const match = await findPartInDetailListByDescription(
         targetPage,
         {
@@ -403,7 +425,7 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
 
     lastStep = 'openDetailList';
     status('Opening detail list...');
-    throwIfAborted(options.abortSignal);
+    throwIfAborted(options.abortSignal, workTimeoutController?.signal.aborted);
     await openDetailList(targetPage);
 
     lastStep = 'extractBuildSheet';
@@ -457,6 +479,7 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
     }
     throw err;
   } finally {
+    disarmWorkTimeout();
     await browser.close().catch(() => {});
   }
 

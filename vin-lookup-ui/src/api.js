@@ -1,5 +1,15 @@
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
+function getWsBase() {
+  try {
+    const u = new URL(API_BASE);
+    u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+    return u.origin;
+  } catch {
+    return 'ws://localhost:3000';
+  }
+}
+
 export async function fetchPartNumber({ vin, cartName, skuQuery }) {
   const effectiveCart = (cartName && cartName.trim()) ? cartName.trim() : vin.trim();
   const res = await fetch(`${API_BASE}/api/vin-lookup`, {
@@ -19,6 +29,71 @@ export async function fetchPartNumber({ vin, cartName, skuQuery }) {
     throw err;
   }
   return json.data;
+}
+
+/**
+ * Fetch part number via WebSocket. Calls onStatus(message) for progress and onAwaitingSelection when parts are ready.
+ * Resolves with the result data. Rejects on error message or connection failure (so browser-closed and other server errors reach the UI).
+ */
+export function fetchPartNumberStreamViaWs({ vin, cartName, skuQuery }, { onStatus, onAwaitingSelection }) {
+  const effectiveCart = (cartName && cartName.trim()) ? cartName.trim() : vin.trim();
+  const params = new URLSearchParams({
+    vin: vin.trim(),
+    cartName: effectiveCart,
+    skuQuery: (skuQuery ?? '').trim(),
+  });
+  const wsUrl = `${getWsBase()}/api/vin-lookup/ws?${params}`;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      try { ws.close(); } catch { /* ignore */ }
+      fn(arg);
+    };
+
+    let ws;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'status' && msg.message) {
+          onStatus(msg.message);
+        } else if (msg.type === 'awaiting_selection' && msg.jobId != null) {
+          if (onAwaitingSelection) {
+            onAwaitingSelection({
+              jobId: msg.jobId,
+              parts: msg.parts ?? [],
+              suggestedPart: msg.suggestedPart,
+              partsPerTerm: msg.partsPerTerm,
+            });
+          }
+        } else if (msg.type === 'result' && msg.data) {
+          finish(resolve, msg.data);
+        } else if (msg.type === 'error' && msg.message) {
+          finish(reject, new Error(msg.message));
+        }
+      } catch { /* ignore parse */ }
+    };
+
+    ws.onerror = () => {
+      finish(reject, new Error('Connection error'));
+    };
+
+    ws.onclose = (event) => {
+      if (settled) return;
+      if (event.code === 1000 || event.code === 1005) return;
+      settled = true;
+      reject(new Error(event.reason || 'Connection closed'));
+    };
+  });
 }
 
 /**
@@ -73,7 +148,7 @@ export function fetchPartNumberStream({ vin, cartName, skuQuery }, { onStatus, o
                   reject(new Error(payload.message));
                   return;
                 }
-              } catch (_) {}
+              } catch { /* ignore parse */ }
             }
             read();
           }).catch((err) => {

@@ -1,6 +1,15 @@
-# VIN Lookup
+# VIN Lookup — AI-Powered OEM Parts Intelligence
 
-A full-stack tool that automates VIN (Vehicle Identification Number) lookups on the RepairLink/OnCommand portal. It scrapes OEM part information and vehicle build data, caches results in a PostgreSQL database, and serves them through a React web UI with real-time streaming.
+An AI-driven VIN lookup platform that instantly retrieves OEM part numbers, vehicle build data, and pricing from the RepairLink/OnCommand portal — eliminating hours of manual searching.
+
+**Built with AI at its core:** The system uses **AI context understanding** to interpret vague or complex part queries (e.g., "steering gear" or "front brake assembly") and intelligently maps them to the correct OEM catalog entries. Through **AI-powered suggestions**, it resolves ambiguous search results by recommending the most relevant parts based on learned patterns. An **AI learning layer** continuously improves search accuracy using curated query examples, so the tool gets smarter with every lookup.
+
+**Why teams choose this tool:**
+- **Instant results** — Cached lookups return in milliseconds; no repeated scraping
+- **AI-smart search** — Understands natural language part queries and auto-categorizes results using GPT-4o
+- **Real-time streaming** — Live progress updates via SSE so you always know what's happening
+- **Zero manual effort** — Fully automated browser workflow handles login, navigation, and data extraction
+- **Production-ready** — PostgreSQL caching, session persistence, error recovery, and job cancellation built in
 
 ---
 

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 
 import './App.css';
-import { fetchPartNumberStream, submitSelection, submitSelections, submitStop, saveManualLookup } from './api';
+import { fetchPartNumberStreamViaWs, submitSelection, submitSelections, submitStop, saveManualLookup } from './api';
 import Loader from './components/Loader';
 import LookupForm from './components/LookupForm';
 import LookupResult from './components/LookupResult';
@@ -60,7 +60,7 @@ function App() {
     }, 120);
 
     try {
-      const data = await fetchPartNumberStream(
+      const data = await fetchPartNumberStreamViaWs(
         { vin, cartName, skuQuery: query },
         {
           onStatus: (message) => {
@@ -152,17 +152,33 @@ function App() {
             selectedPartIndex={selectedPartIndex}
             selectedPartsByTerm={selectedPartsByTerm}
             suggestedPart={suggestedPart}
-            onSelectPart={(part, partIndex) => {
+            onSelectPart={async (part, partIndex) => {
               setSelectedPart(part);
               setSelectedPartIndex(partIndex ?? null);
-              submitSelection(jobId, part, partIndex);
+              if (!jobId) {
+                setError('Session lost. Please run the lookup again.');
+                return;
+              }
+              try {
+                await submitSelection(jobId, part, partIndex);
+              } catch (err) {
+                setError(err?.message || 'Failed to submit selection. Please try again or stop.');
+              }
             }}
             onSelectPartForTerm={(termIndex, part) => {
               setSelectedPartsByTerm((prev) => ({ ...prev, [termIndex]: part }));
             }}
-            onConfirmSelections={() => {
+            onConfirmSelections={async () => {
+              if (!jobId) {
+                setError('Session lost. Please run the lookup again.');
+                return;
+              }
               const selections = partsPerTerm.map((_, i) => ({ termIndex: i, selectedPart: selectedPartsByTerm[i] }));
-              submitSelections(jobId, selections);
+              try {
+                await submitSelections(jobId, selections);
+              } catch (err) {
+                setError(err?.message || 'Failed to submit selection. Please try again or stop.');
+              }
             }}
             onStop={() => submitStop(jobId)}
           />

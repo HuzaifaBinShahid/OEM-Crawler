@@ -164,7 +164,7 @@ function LookupResult({ result, awaitingSelection, onSelectPart, onSelectPartFor
                       <button
                         type="button"
                         className={`btn-tick ${isSelected ? 'selected' : ''}`}
-                        onClick={() => onSelectPart && onSelectPart(p)}
+                        onClick={() => onSelectPart && onSelectPart(p, i)}
                         aria-label={isSelected ? 'Selected' : 'Select this part'}
                         title={isSelected ? 'Selected' : 'Select as correct part'}
                       >
