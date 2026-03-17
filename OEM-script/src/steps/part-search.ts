@@ -1,5 +1,6 @@
 import type { Page } from 'playwright';
 import { getReferenceTextForPromptAsync, appendLearnedExample } from '../data/query-examples.js';
+import type { Config } from '../config.js';
 import { loadConfig } from '../config.js';
 import { selectors } from '../selectors.js';
 import {
@@ -56,6 +57,116 @@ export interface PartRow {
   servicePartNumber?: string;
   requiredQuantity?: string;
   rowIndex?: number;
+  /** Path from openSec2 second arg (ChassisArts), e.g. /npc/myportal/ChassisArts?vartn_id=... */
+  figurePagePath?: string;
+  /** Resolved figure image URL after fetching from figure page */
+  figureImageUrl?: string;
+}
+
+/** Parse openSec2('partNo','/path/to/ChassisArts?...') second argument for figure page path. */
+function parseOpenSec2FigurePath(onclick: string | null): string | undefined {
+  if (!onclick || typeof onclick !== 'string') return undefined;
+  const m = /openSec2\s*\(\s*'[^']*'\s*,\s*'([^']*)'/.exec(onclick);
+  if (!m) return undefined;
+  return m[1]!.replace(/&amp;/g, '&').trim() || undefined;
+}
+
+const FIGURE_PAGE_TIMEOUT_MS = 15_000;
+const FIGURE_IMAGE_WAIT_MS = 6_000;
+
+/** Build full image URL from ChassisArts JSON figrFileNme (e.g. "/../pco/images/12MDT007801.gif"). */
+function figureFileNameToUrl(figrFileNme: string, base: string): string {
+  const normalized = figrFileNme.replace(/^\/+\.\.\//, '/').replace(/^\/+/, '/');
+  return `${base.replace(/\/$/, '')}${normalized}`;
+}
+
+/** Open figure page in same tab. If ChassisArts returns JSON with figrFileNme, use that; else wait for #mapster_wrap_0 img. Then navigate back to saved URL. */
+async function fetchFigureImageUrlFromPath(
+  page: Page,
+  figurePath: string,
+  config: Config,
+): Promise<string | undefined> {
+  const path = figurePath.startsWith('/') ? figurePath : `/${figurePath}`;
+  const currentUrl = page.url();
+  let origin: string;
+  try {
+    origin = new URL(currentUrl).origin;
+  } catch {
+    origin = config.navistarPortalBaseUrl.replace(/\/$/, '');
+  }
+  const figureUrl = `${origin}${path}`;
+  const base = config.navistarPortalBaseUrl.replace(/\/$/, '');
+
+  try {
+    await page.goto(figureUrl, { waitUntil: 'domcontentloaded', timeout: FIGURE_PAGE_TIMEOUT_MS });
+    await sleep(500);
+
+    const bodyText = await page.evaluate(() => document.body?.innerText?.trim() ?? '').catch(() => '');
+    const jsonMatch = bodyText.match(/^\s*\[/);
+    if (jsonMatch) {
+      try {
+        const data = JSON.parse(bodyText) as Array<{ figrFileNme?: string }>;
+        const first = Array.isArray(data) && data.length > 0 ? data[0] : null;
+        const figrFileNme = first?.figrFileNme;
+        if (figrFileNme && typeof figrFileNme === 'string') {
+          const imageUrl = figureFileNameToUrl(figrFileNme, base);
+          return imageUrl;
+        }
+      } catch {
+        /* not valid JSON, fall through to DOM scrape */
+      }
+    }
+
+    await page.waitForSelector('#mapster_wrap_0 img, [id^="mapster_wrap"] img', {
+      state: 'visible',
+      timeout: FIGURE_IMAGE_WAIT_MS,
+    }).catch(() => null);
+    await sleep(600);
+
+    const imgSrc = await page
+      .evaluate(() => {
+        const wrap = document.querySelector('#mapster_wrap_0, [id^="mapster_wrap"]');
+        const img = wrap?.querySelector('img.mapster_el, img.img-responsive, img') as HTMLImageElement | null;
+        const src = img?.src?.trim();
+        if (!src || src === '' || src === window.location.href) return null;
+        return src;
+      })
+      .catch(() => null);
+
+    if (imgSrc && imgSrc.startsWith('http')) return imgSrc;
+    if (imgSrc && imgSrc.startsWith('/')) return `${base}${imgSrc}`;
+    return imgSrc || undefined;
+  } catch {
+    return undefined;
+  } finally {
+    await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: FIGURE_PAGE_TIMEOUT_MS }).catch(() => {});
+  }
+}
+
+/** For each part with figurePagePath, open figure page and set figureImageUrl. Dedupes by path. */
+export async function enrichPartsWithFigureImages(
+  page: Page,
+  parts: PartRow[],
+  config: Config,
+  onStatus?: (message: string) => void,
+): Promise<void> {
+  const paths = [...new Set(parts.map((p) => p.figurePagePath).filter(Boolean))] as string[];
+  if (paths.length === 0) return;
+  const status = (msg: string) => {
+    console.log('[part-search]', msg);
+    onStatus?.(msg);
+  };
+  const pathToUrl = new Map<string, string>();
+  for (const path of paths) {
+    status('Fetching figure image...');
+    const imageUrl = await fetchFigureImageUrlFromPath(page, path, config);
+    if (imageUrl) pathToUrl.set(path, imageUrl);
+  }
+  for (const p of parts) {
+    if (p.figurePagePath && pathToUrl.has(p.figurePagePath)) {
+      p.figureImageUrl = pathToUrl.get(p.figurePagePath);
+    }
+  }
 }
 
 function normalize(s: string): string {
@@ -126,8 +237,10 @@ async function scrapeAllTableRows(page: Page): Promise<{ parts: PartRow[]; relat
           servicePartNumber?: string;
           requiredQuantity?: string;
           rowIndex: number;
+          figurePagePath?: string;
         }> = [];
         const relatedLinkRowIndices: number[] = [];
+        const openSec2Re = /openSec2\s*\(\s*'[^']*'\s*,\s*'([^']*)'/;
         for (let i = 0; i < rows.length; i++) {
           const row = rows[i] as HTMLTableRowElement;
           if (row.classList.contains('group')) continue;
@@ -144,6 +257,14 @@ async function scrapeAllTableRows(page: Page): Promise<{ parts: PartRow[]; relat
           const item = (tds[1]?.textContent || '').trim();
           const servicePartNumber = (tds[4]?.textContent || '').trim() || undefined;
           const requiredQuantity = tds.length > 6 ? (tds[6]?.textContent || '').trim() : undefined;
+          let figurePagePath = undefined;
+          const lastCell = tds[tds.length - 1];
+          const figLink = lastCell?.querySelector('a[onclick*="openSec2"]');
+          const onclick = (figLink || link)?.getAttribute('onclick');
+          if (onclick && openSec2Re.test(onclick)) {
+            const m = openSec2Re.exec(onclick);
+            if (m) figurePagePath = m[1].replace(/&amp;/g, '&').trim() || undefined;
+          }
           if (!partNumber && !description) continue;
           const hasRelated = row.querySelector(`td:nth-child(${optionsCol}) img.relatedURL`) != null;
           parts.push({
@@ -153,6 +274,7 @@ async function scrapeAllTableRows(page: Page): Promise<{ parts: PartRow[]; relat
             servicePartNumber: servicePartNumber || undefined,
             requiredQuantity: requiredQuantity || undefined,
             rowIndex: i,
+            figurePagePath,
           });
           if (hasRelated) relatedLinkRowIndices.push(i);
         }
@@ -184,8 +306,13 @@ async function scrapeAllTableRows(page: Page): Promise<{ parts: PartRow[]; relat
     if (/no matching records found/i.test(rowText)) continue;
     const item = tds[1]?.trim();
     const partNumCell = row.locator('td:nth-child(3)');
-    let partNumber = (await partNumCell.locator('a').first().innerText().catch(() => '')).trim();
+    const linkEl = partNumCell.locator('a').first();
+    let partNumber = (await linkEl.innerText().catch(() => '')).trim();
     if (!partNumber) partNumber = tds[2]?.trim() ?? '';
+    const figLinkEl = row.locator('td').last().locator('a[onclick*="openSec2"]').first();
+    let onclick = await figLinkEl.getAttribute('onclick').catch(() => null);
+    if (!onclick) onclick = await linkEl.getAttribute('onclick').catch(() => null);
+    const figurePagePath = parseOpenSec2FigurePath(onclick);
     const description = tds[3]?.trim() ?? '';
     const servicePartNumber = tds[4]?.trim() || undefined;
     const requiredQuantity = tds.length > 6 ? tds[6]?.trim() : undefined;
@@ -197,6 +324,7 @@ async function scrapeAllTableRows(page: Page): Promise<{ parts: PartRow[]; relat
         servicePartNumber,
         requiredQuantity,
         rowIndex: i,
+        figurePagePath,
       });
       const relatedLink = row.locator(`td:nth-child(${OPTIONS_COL}) img.relatedURL`).first();
       const hasLink = await relatedLink.isVisible().catch(() => false);
@@ -210,7 +338,8 @@ async function scrapeSearchTabTableRows(page: Page): Promise<PartRow[]> {
   const result = await page
     .evaluate(() => {
       const rows = document.querySelectorAll('#partsTable tbody tr');
-      const parts: Array<{ partNumber: string; description: string; servicePartNumber?: string; requiredQuantity?: string; rowIndex: number }> = [];
+      const parts: Array<{ partNumber: string; description: string; servicePartNumber?: string; requiredQuantity?: string; rowIndex: number; figurePagePath?: string }> = [];
+      const openSec2Re = /openSec2\s*\(\s*'[^']*'\s*,\s*'([^']*)'/;
       for (let i = 0; i < rows.length; i++) {
         const row = rows[i] as HTMLTableRowElement;
         if (row.classList.contains('group')) continue;
@@ -221,11 +350,19 @@ async function scrapeSearchTabTableRows(page: Page): Promise<PartRow[]> {
         const rowText = row.innerText || '';
         if (/no matching records found/i.test(rowText)) continue;
         const partNumCell = tds[1];
-        const link = partNumCell?.querySelector('a');
-        const partNumber = (link?.textContent || (tds[1]?.textContent || '')).trim();
+        const partLink = partNumCell?.querySelector('a');
+        const partNumber = (partLink?.textContent || (tds[1]?.textContent || '')).trim();
         const description = (tds[2]?.textContent || '').trim();
         const servicePartNumber = (tds[3]?.textContent || '').trim() || undefined;
         const requiredQuantity = tds.length > 4 ? (tds[4]?.textContent || '').trim() : undefined;
+        let figurePagePath = undefined;
+        const lastCell = tds[tds.length - 1];
+        const figLink = lastCell?.querySelector('a[onclick*="openSec2"]');
+        const onclick = (figLink || partLink)?.getAttribute('onclick');
+        if (onclick && openSec2Re.test(onclick)) {
+          const m = openSec2Re.exec(onclick);
+          if (m) figurePagePath = m[1].replace(/&amp;/g, '&').trim() || undefined;
+        }
         if (!partNumber && !description) continue;
         parts.push({
           partNumber,
@@ -233,6 +370,7 @@ async function scrapeSearchTabTableRows(page: Page): Promise<PartRow[]> {
           servicePartNumber: servicePartNumber || undefined,
           requiredQuantity: requiredQuantity || undefined,
           rowIndex: i,
+          figurePagePath,
         });
       }
       return parts;
@@ -240,6 +378,14 @@ async function scrapeSearchTabTableRows(page: Page): Promise<PartRow[]> {
     .catch(() => null);
   if (result && Array.isArray(result)) return result as PartRow[];
   return [];
+}
+
+function formatWordSearchForEitherOrBoth(query: string): string {
+  const trimmed = query.trim();
+  if (!trimmed) return trimmed;
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  if (words.length <= 1) return trimmed;
+  return words.map((w) => w.trim()).join(', ');
 }
 
 export async function findPartViaSearchTab(
@@ -254,6 +400,10 @@ export async function findPartViaSearchTab(
   const q = query.trim();
   if (!q) return { parts: [], noMatch: false };
 
+  const words = q.split(/\s+/).filter(Boolean);
+  const isMultiWord = words.length >= 2;
+  const wordSearchQuery = isMultiWord ? formatWordSearchForEitherOrBoth(q) : q;
+
   status('Moving to search page...');
   const searchTab = page.locator(oc.searchTab).first();
   await searchTab.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
@@ -262,8 +412,8 @@ export async function findPartViaSearchTab(
 
   const wordSearch = page.locator(oc.wordSearch).first();
   await wordSearch.waitFor({ state: 'visible', timeout: 8000 }).catch(() => {});
-  await wordSearch.fill(q);
-  status('Writing in search bar...');
+  await wordSearch.fill(wordSearchQuery);
+  status(isMultiWord ? 'Writing words in search bar (either or both)...' : 'Writing in search bar...');
   await page.locator(oc.wordSearchButton).first().click();
   await sleep(600);
 
@@ -271,16 +421,24 @@ export async function findPartViaSearchTab(
   status('Looking in table...');
   const filterInput = page.locator(oc.partsTableFilter).first();
   await filterInput.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
-  await filterInput.fill(q);
+  let effectiveFilter: string;
+  if (isMultiWord) {
+    effectiveFilter = '';
+  } else {
+    await filterInput.fill(q);
+    effectiveFilter = q;
+  }
   await sleep(500);
 
   const emptyCell = page.locator(oc.partsTable).locator('td.dataTables_empty').first();
   const emptyVisible = await emptyCell.isVisible().catch(() => false);
-  let effectiveFilter = q;
   if (emptyVisible) {
     const emptyText = await emptyCell.textContent().catch(() => '');
     if (/no matching records found/i.test(emptyText ?? '')) {
-      const words = q.split(/\s+/).filter(Boolean);
+      if (isMultiWord) {
+        status('No matches found for this record.');
+        return { parts: [], noMatch: true };
+      }
       if (words.length >= 2) {
         status('No matches found. Trying another combination...');
         const firstHalf = words[0]!;
@@ -365,6 +523,9 @@ export async function findPartViaSearchTab(
     await sleep(400);
   }
 
+  const config = loadConfig();
+  await enrichPartsWithFigureImages(page, collectedParts, config, onStatus);
+
   return { parts: collectedParts, noMatch: false };
 }
 
@@ -384,19 +545,26 @@ export async function searchAgainOnSamePage(
   const q = term.trim();
   if (!q) return { parts: [], noMatch: false };
 
+  const words = q.split(/\s+/).filter(Boolean);
+  const isMultiWord = words.length >= 2;
+  const wordSearchQuery = isMultiWord ? formatWordSearchForEitherOrBoth(q) : q;
+
   const wordSearch = page.locator(oc.wordSearch).first();
   await wordSearch.waitFor({ state: 'visible', timeout: 8000 }).catch(() => {});
   status('Clearing search bar and searching for next part...');
   await wordSearch.fill('');
   await sleep(300);
-  await wordSearch.fill(q);
+  await wordSearch.fill(wordSearchQuery);
   await page.locator(oc.wordSearchButton).first().click();
   await sleep(600);
 
   await waitForPartsTableReady(page);
   const filterInput = page.locator(oc.partsTableFilter).first();
   await filterInput.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
-  await filterInput.fill(q);
+  const effectiveFilter = isMultiWord ? '' : q;
+  if (!isMultiWord) {
+    await filterInput.fill(q);
+  }
   await sleep(500);
 
   const emptyCell = page.locator(oc.partsTable).locator('td.dataTables_empty').first();
@@ -432,9 +600,12 @@ export async function searchAgainOnSamePage(
     status(`Moving to page ${pageNum}...`);
     const nextOk = await goToNextPartsTablePage(page);
     if (!nextOk) break;
-    await filterInput.fill(q);
+    await filterInput.fill(effectiveFilter);
     await sleep(400);
   }
+
+  const config = loadConfig();
+  await enrichPartsWithFigureImages(page, collectedParts, config, onStatus);
 
   return { parts: collectedParts, noMatch: false };
 }

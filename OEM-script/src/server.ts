@@ -9,10 +9,17 @@ import { registerJobCancel, abortJob, clearJobCancel } from "./job-cancel.js";
 import { ScraperCancelledError, ScraperTimeoutError } from "./scraper-cancelled-error.js";
 import { loadConfig } from "./config.js";
 import { connectDb, disconnectDb } from "./db/connection.js";
-import { findVinLookup, saveVinLookup } from "./db/vin-lookup-repo.js";
+import { runMigrations } from "./db/init-db.js";
+import { findVinLookup, getLookupsByUserId, saveVinLookup } from "./db/vin-lookup-repo.js";
+import { getDashboardStats } from "./db/admin-stats-repo.js";
 import { runVinLookup } from "./runner.js";
 import type { VinLookupResult } from "./runner.js";
 import { logScraperError } from "./services/error-handler.js";
+import { requireAuth, requireAdmin } from "./auth/middleware.js";
+import { handleSignup, handleLogin, handleMe } from "./auth/auth-routes.js";
+import { seedAdminIfNeeded } from "./auth/seed-admin.js";
+import { verifyToken } from "./auth/jwt.js";
+import { createUser, deleteUser, findAllUsers, findUserById, updateUser } from "./auth/user-repo.js";
 
 /** Generic message shown to client on error; exact error is only written to log files. */
 const GENERIC_ERROR_MESSAGE = "An error occurred. Please try again later.";
@@ -46,7 +53,178 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.get("/api/vin-lookup", async (req, res) => {
+app.post("/api/auth/signup", (req, res) => {
+  handleSignup(req, res).catch((err) => {
+    console.error("[api] signup error:", err);
+    sendServerErrorResponse(res);
+  });
+});
+
+app.post("/api/auth/login", (req, res) => {
+  handleLogin(req, res).catch((err) => {
+    console.error("[api] login error:", err);
+    sendServerErrorResponse(res);
+  });
+});
+
+app.get("/api/auth/me", requireAuth, handleMe);
+
+app.get("/api/users/me/stats", requireAuth, async (req, res) => {
+  try {
+    const userId = req.user!.id;
+    const { total, lookups } = await getLookupsByUserId(userId);
+    const lookupsSerialized = lookups.map((r) => ({
+      id: r.id,
+      query_vin: r.query_vin,
+      query_cart_name: r.query_cart_name,
+      query_sku_query: r.query_sku_query,
+      created_at: r.created_at instanceof Date ? r.created_at.toISOString() : r.created_at,
+    }));
+    apiResponse(res, 200, { totalLookups: total, lookups: lookupsSerialized }, "Success", null);
+  } catch (err) {
+    console.error("[api] users/me/stats error:", err);
+    sendServerErrorResponse(res);
+  }
+});
+
+app.patch("/api/users/me", requireAuth, async (req, res) => {
+  try {
+    const body = req.body as { password?: string };
+    const password = typeof body?.password === "string" ? body.password : "";
+    if (!password || password.length < 8) {
+      apiResponse(res, 400, null, "Bad request", "Password must be at least 8 characters");
+      return;
+    }
+    const { hashPassword } = await import("./auth/hash.js");
+    const passwordHash = await hashPassword(password);
+    await updateUser({ id: req.user!.id, passwordHash });
+    apiResponse(res, 200, null, "Password updated", null);
+  } catch (err) {
+    console.error("[api] users/me change password error:", err);
+    sendServerErrorResponse(res);
+  }
+});
+
+app.get("/api/admin/stats", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const stats = await getDashboardStats();
+    apiResponse(res, 200, stats, "Success", null);
+  } catch (err) {
+    console.error("[api] admin stats error:", err);
+    sendServerErrorResponse(res);
+  }
+});
+
+app.get("/api/admin/users", requireAuth, requireAdmin, async (_req, res) => {
+  try {
+    const users = await findAllUsers();
+    apiResponse(res, 200, users, "Success", null);
+  } catch (err) {
+    console.error("[api] admin list users error:", err);
+    sendServerErrorResponse(res);
+  }
+});
+
+app.post("/api/admin/users", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const body = req.body as { email?: string; password?: string };
+    const email = typeof body?.email === "string" ? body.email.trim().toLowerCase() : "";
+    const password = typeof body?.password === "string" ? body.password : "";
+
+    if (!email || !password) {
+      apiResponse(res, 400, null, "Bad request", "Email and password are required");
+      return;
+    }
+    if (!email.includes("@")) {
+      apiResponse(res, 400, null, "Bad request", "Invalid email format");
+      return;
+    }
+    if (password.length < 8) {
+      apiResponse(res, 400, null, "Bad request", "Password must be at least 8 characters");
+      return;
+    }
+
+    const { hashPassword } = await import("./auth/hash.js");
+    const passwordHash = await hashPassword(password);
+    const user = await createUser({ email, passwordHash, role: "internal" });
+    apiResponse(res, 201, { id: user.id, email: user.email, role: user.role }, "Created", null);
+  } catch (err) {
+    console.error("[api] admin create user error:", err);
+    sendServerErrorResponse(res);
+  }
+});
+
+app.patch("/api/admin/users/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      apiResponse(res, 400, null, "Bad request", "Invalid user id");
+      return;
+    }
+
+    const existing = await findUserById(id);
+    if (!existing) {
+      apiResponse(res, 404, null, "Not found", "User not found");
+      return;
+    }
+
+    const body = req.body as { email?: string; password?: string };
+    const updates: { email?: string; passwordHash?: string } = {};
+
+    if (typeof body?.email === "string" && body.email.trim()) {
+      const normalized = body.email.trim().toLowerCase();
+      if (!normalized.includes("@")) {
+        apiResponse(res, 400, null, "Bad request", "Invalid email format");
+        return;
+      }
+      updates.email = normalized;
+    }
+
+    if (typeof body?.password === "string" && body.password) {
+      if (body.password.length < 8) {
+        apiResponse(res, 400, null, "Bad request", "Password must be at least 8 characters");
+        return;
+      }
+      const { hashPassword } = await import("./auth/hash.js");
+      updates.passwordHash = await hashPassword(body.password);
+    }
+
+    const updated = await updateUser({ id, ...updates });
+    apiResponse(res, 200, { id: updated.id, email: updated.email, role: updated.role }, "Success", null);
+  } catch (err) {
+    console.error("[api] admin update user error:", err);
+    sendServerErrorResponse(res);
+  }
+});
+
+app.delete("/api/admin/users/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      apiResponse(res, 400, null, "Bad request", "Invalid user id");
+      return;
+    }
+
+    if (req.user && req.user.id === id) {
+      apiResponse(res, 400, null, "Bad request", "You cannot delete your own admin user");
+      return;
+    }
+
+    const existing = await findUserById(id);
+    if (!existing) {
+      apiResponse(res, 404, null, "Not found", "User not found");
+      return;
+    }
+
+    await deleteUser(id);
+    res.status(204).send();
+  } catch (err) {
+    console.error("[api] admin delete user error:", err);
+    sendServerErrorResponse(res);
+  }
+});
+
+app.get("/api/vin-lookup", requireAuth, async (req, res) => {
   const vin = (req.query.vin as string)?.trim();
   const cartName = (req.query.cartName as string)?.trim() || "default-cart";
   const skuQuery = (req.query.skuQuery as string)?.trim() || undefined;
@@ -56,8 +234,9 @@ app.get("/api/vin-lookup", async (req, res) => {
     return;
   }
 
+  const userId = req.user!.id;
   try {
-    const cached = await findVinLookup({ vin, cartName, skuQuery });
+    const cached = await findVinLookup({ vin, cartName, skuQuery }, userId);
     if (cached) {
       if (skuQuery && (!cached.found || (cached.parts && cached.parts.length === 0))) {
         const config = loadConfig();
@@ -106,7 +285,7 @@ app.get("/api/vin-lookup", async (req, res) => {
       apiResponse(res, 404, null, "Part was not found in the detail list for the given query.", null);
       return;
     }
-    await saveVinLookup({ vin, cartName, skuQuery }, result);
+    await saveVinLookup({ vin, cartName, skuQuery }, result, userId);
     apiResponse(res, 200, result, "Success", null);
   } catch (err) {
     console.error("[api] Scraper error:", err);
@@ -123,7 +302,7 @@ app.get("/api/vin-lookup", async (req, res) => {
   }
 });
 
-app.post("/api/vin-lookup", async (req, res) => {
+app.post("/api/vin-lookup", requireAuth, async (req, res) => {
   const body = req.body as Record<string, unknown>;
   const vin = typeof body?.vin === "string" ? body.vin.trim() : "";
   const cartName =
@@ -136,8 +315,9 @@ app.post("/api/vin-lookup", async (req, res) => {
     return;
   }
 
+  const userId = req.user!.id;
   try {
-    const cached = await findVinLookup({ vin, cartName, skuQuery });
+    const cached = await findVinLookup({ vin, cartName, skuQuery }, userId);
     if (cached) {
       if (skuQuery && (!cached.found || (cached.parts && cached.parts.length === 0))) {
         const config = loadConfig();
@@ -186,7 +366,7 @@ app.post("/api/vin-lookup", async (req, res) => {
       apiResponse(res, 404, null, "Part was not found in the detail list for the given query.", null);
       return;
     }
-    await saveVinLookup({ vin, cartName, skuQuery }, result);
+    await saveVinLookup({ vin, cartName, skuQuery }, result, userId);
     apiResponse(res, 200, result, "Success", null);
   } catch (err) {
     console.error("[api] Scraper error:", err);
@@ -203,7 +383,7 @@ app.post("/api/vin-lookup", async (req, res) => {
   }
 });
 
-app.post("/api/vin-lookup/stream/select", (req, res) => {
+app.post("/api/vin-lookup/stream/select", requireAuth, (req, res) => {
   const body = req.body as {
     jobId?: string;
     selectedPart?: { sku?: string; description?: string; section?: string; compatibility?: string };
@@ -249,7 +429,7 @@ app.post("/api/vin-lookup/stream/select", (req, res) => {
   res.status(200).json({ data: { ok: true }, message: "Success", error: null });
 });
 
-app.post("/api/vin-lookup/stream/stop", (req, res) => {
+app.post("/api/vin-lookup/stream/stop", requireAuth, (req, res) => {
   const body = req.body as { jobId?: string };
   const jobId = typeof body?.jobId === "string" ? body.jobId.trim() : "";
   if (!jobId) {
@@ -262,7 +442,7 @@ app.post("/api/vin-lookup/stream/stop", (req, res) => {
 });
 
 /** Save a "part not found" result manually with user-edited section/subcategory. POST body: { vin, cartName, skuQuery, result } where result has found: true and parts with section (and optional subcategory) set. */
-app.post("/api/vin-lookup/save-manual", async (req, res) => {
+app.post("/api/vin-lookup/save-manual", requireAuth, async (req, res) => {
   const body = req.body as {
     vin?: string;
     cartName?: string;
@@ -295,8 +475,9 @@ app.post("/api/vin-lookup/save-manual", async (req, res) => {
     scrapedAt: result.scrapedAt,
   };
 
+  const userId = req.user!.id;
   try {
-    await saveVinLookup({ vin, cartName, skuQuery }, toSave);
+    await saveVinLookup({ vin, cartName, skuQuery }, toSave, userId);
     res.status(200).json({ data: toSave, message: "Saved", error: null });
   } catch (err) {
     console.error("[api] save-manual error:", err);
@@ -305,7 +486,7 @@ app.post("/api/vin-lookup/save-manual", async (req, res) => {
 });
 
 /** Server-Sent Events stream for VIN lookup with live status messages. GET with ?vin=...&cartName=...&skuQuery=... */
-app.get("/api/vin-lookup/stream", async (req, res) => {
+app.get("/api/vin-lookup/stream", requireAuth, async (req, res) => {
   const vin = (req.query.vin as string)?.trim();
   const cartName = (req.query.cartName as string)?.trim() || "default-cart";
   const skuQuery = (req.query.skuQuery as string)?.trim() || undefined;
@@ -315,6 +496,7 @@ app.get("/api/vin-lookup/stream", async (req, res) => {
     return;
   }
 
+  const userId = req.user!.id;
   function sendEvent(type: "status" | "result" | "error" | "awaiting_selection", payload: unknown): void {
     const line = JSON.stringify({ type, ...(typeof payload === "object" && payload !== null ? payload : { data: payload }) });
     res.write(`data: ${line}\n\n`);
@@ -324,7 +506,7 @@ app.get("/api/vin-lookup/stream", async (req, res) => {
   }
 
   try {
-    const cached = await findVinLookup({ vin, cartName, skuQuery });
+    const cached = await findVinLookup({ vin, cartName, skuQuery }, userId);
     if (cached) {
       if (skuQuery && !cached.found && (!cached.parts || cached.parts.length === 0)) {
         const config = loadConfig();
@@ -428,7 +610,7 @@ app.get("/api/vin-lookup/stream", async (req, res) => {
       return;
     }
     if (skuQuery && result.found) {
-      await saveVinLookup({ vin, cartName, skuQuery }, result);
+      await saveVinLookup({ vin, cartName, skuQuery }, result, userId);
     }
     sendEvent("result", { data: result });
   } catch (err) {
@@ -483,12 +665,15 @@ function getStreamErrorMessage(err: unknown): string {
 async function main(): Promise<void> {
   const config = loadConfig();
   await connectDb();
+  await runMigrations();
+  await seedAdminIfNeeded();
 
   const server = http.createServer(app);
 
   const wss = new WebSocketServer({ server, path: "/api/vin-lookup/ws" });
   wss.on("connection", async (ws: WebSocket, req: IncomingMessage) => {
     const url = new URL(req.url ?? "", `http://${req.headers.host ?? "localhost"}`);
+    const token = url.searchParams.get("token")?.trim() || null;
     const vin = (url.searchParams.get("vin") ?? "").trim();
     const cartName = (url.searchParams.get("cartName") ?? "").trim() || "default-cart";
     const skuQuery = (url.searchParams.get("skuQuery") ?? "").trim() || undefined;
@@ -501,6 +686,19 @@ async function main(): Promise<void> {
       }
     };
 
+    if (!token) {
+      send({ type: "error", message: "Missing token" });
+      ws.close();
+      return;
+    }
+    const payload = verifyToken(token);
+    if (!payload || payload.sub == null) {
+      send({ type: "error", message: "Invalid or expired token" });
+      ws.close();
+      return;
+    }
+    const userId = payload.sub;
+
     if (!vin) {
       send({ type: "error", message: "Missing required query: vin" });
       ws.close();
@@ -508,7 +706,7 @@ async function main(): Promise<void> {
     }
 
     try {
-      const cached = await findVinLookup({ vin, cartName, skuQuery });
+      const cached = await findVinLookup({ vin, cartName, skuQuery }, userId);
       if (cached) {
         if (skuQuery && !cached.found && (!cached.parts || cached.parts.length === 0)) {
           send({ type: "error", message: "Part was not found in the detail list for the given query." });
@@ -565,7 +763,7 @@ async function main(): Promise<void> {
         return;
       }
       if (skuQuery && result.found) {
-        await saveVinLookup({ vin, cartName, skuQuery }, result);
+        await saveVinLookup({ vin, cartName, skuQuery }, result, userId);
       }
       send({ type: "result", data: result });
       ws.close();

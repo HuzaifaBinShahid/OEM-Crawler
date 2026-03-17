@@ -54,6 +54,49 @@ export async function suggestPartFromList(
   return partNames[0] ?? null;
 }
 
+/** Ask AI whether the term is an actual part name (use as-is) or slang/ambiguous (e.g. rotors → brake rotors, starter → starter motor). Returns the exact search phrase to use. */
+export async function suggestSearchTermForPart(
+  apiKey: string,
+  userTerm: string,
+  referenceText?: string,
+): Promise<string | null> {
+  if (!apiKey.trim() || !userTerm.trim()) return null;
+  let systemContent =
+    "You are an automotive parts catalog search assistant. The user will give a single part term. Your job is to decide: is this already a clear, specific part name we should search as-is, or is it slang/ambiguous?\n\n" +
+    "Examples: 'rotors' in automobiles usually means brake rotors (or brake discs) → reply 'brake rotors'. 'starter' → 'starter motor'. 'alternator' is a clear part name → reply 'alternator' as-is. 'fuel pump' → 'fuel pump' as-is. 'rad' → 'radiator'. 'plugs' → 'spark plugs'. 'head' → 'cylinder head'.\n\n" +
+    "Reply with ONLY the exact phrase to type in the catalog search box: one line, no explanation. If the term is already a specific part name, return it unchanged. If it is slang or ambiguous, return the canonical/specific automotive part name.";
+  if (referenceText) {
+    systemContent += "\n\n" + referenceText;
+  }
+  const body = {
+    model: OPENAI_MODEL,
+    messages: [
+      { role: "system", content: systemContent },
+      {
+        role: "user",
+        content: `The user entered: "${userTerm.trim()}"\n\nWhat exact search phrase should we use in the parts catalog? Reply with only that phrase:`,
+      },
+    ],
+    max_tokens: 80,
+    temperature: 0.2,
+  };
+  const res = await fetch(OPENAI_CHAT_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey.trim()}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) return null;
+  const data = (await res.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const raw = data.choices?.[0]?.message?.content?.trim();
+  if (!raw) return null;
+  return raw.replace(/\s+/g, " ").trim();
+}
+
 /** From the user's free-text query, extract the single part name to use for the search box. E.g. "i need an alternator" -> "alternator"; "HVAC CONTROL" -> "HVAC CONTROL" (use as-is). */
 export async function extractPartNameForSearch(
   apiKey: string,
@@ -65,12 +108,14 @@ export async function extractPartNameForSearch(
   const examples =
     "Examples: \"i need an alternator\" -> alternator. \"HVAC CONTROL\" -> HVAC CONTROL (use the complete phrase as-is, do not split or change). " +
     "\"need the accelerator pedal sensor\" -> accelerator pedal sensor. \"left headlight\" -> left headlight. \"muffler\" -> muffler. " +
+    "If the user said a slang term (e.g. starter, rad, plugs), return the canonical part name from the terminology. If the term is an official part name (e.g. alternator, fuel pump), return it as-is. " +
     "Reply with ONLY the part name to type in the search box, nothing else.";
 
   let systemContent =
     "You are a parts catalog search assistant. The user entered a natural language query. Extract the single part name or phrase to use for the catalog search box. " +
     "If the query is already a part name or code (e.g. HVAC CONTROL, EXP VALVE), return it exactly as given. " +
-    "If the query is a sentence (e.g. 'i need an alternator'), return only the part name. One line, no explanation.";
+    "If the query is a sentence (e.g. 'i need an alternator'), return only the part name. " +
+    "When the user uses industry slang (e.g. starter, rad, plugs), return the canonical part name for search. When the term is an official part name, return it as-is. One line, no explanation.";
   if (referenceText) {
     systemContent += "\n\n" + referenceText;
   }
@@ -115,7 +160,7 @@ export async function extractPartTermsFromQuery(
   if (!apiKey.trim() || !query.trim()) return [query.trim()];
 
   let systemContent =
-    "You are a parts catalog search assistant. The user entered a query that may describe one or more parts. Your job is to list the individual part or component names they are looking for. Reply with ONLY the searchable part terms, one per line. Use short terms suitable for a search box (e.g. 'muffler', 'clamp', 'fuel tank', 'straps'). Do not include filler words ('i need', 'the', 'a', 'an') or quantities ('2', 'x2'); just the part name. Use singular form when it works for search (e.g. 'clamp' not '2 clamps'). If there is only one part, return one line.";
+    "You are a parts catalog search assistant. The user entered a query that may describe one or more parts. Your job is to list the individual part or component names they are looking for. Reply with ONLY the searchable part terms, one per line. Use short terms suitable for a search box (e.g. 'muffler', 'clamp', 'fuel tank', 'straps'). Do not include filler words ('i need', 'the', 'a', 'an') or quantities ('2', 'x2'); just the part name. Use singular form when it works for search (e.g. 'clamp' not '2 clamps'). When a term is industry slang (e.g. starter, rad, plugs), use the canonical part name from the terminology; when it is an official part name (e.g. alternator, fuel pump), use it as-is. If there is only one part, return one line.";
   if (referenceText) {
     systemContent += "\n\n" + referenceText;
   }

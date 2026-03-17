@@ -1,5 +1,22 @@
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000';
 
+let authToken = null;
+
+export function setAuthToken(token) {
+  authToken = token;
+}
+
+export function getAuthToken() {
+  return authToken;
+}
+
+function getAuthHeaders() {
+  if (authToken) {
+    return { Authorization: `Bearer ${authToken}` };
+  }
+  return {};
+}
+
 function getWsBase() {
   try {
     const u = new URL(API_BASE);
@@ -10,11 +27,122 @@ function getWsBase() {
   }
 }
 
+export async function login({ email, password }) {
+  const res = await fetch(`${API_BASE}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: email.trim(), password }),
+  });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error || json.message || 'Login failed');
+  return json.data;
+}
+
+export async function signup({ email, password }) {
+  const res = await fetch(`${API_BASE}/api/auth/signup`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: email.trim(), password }),
+  });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error || json.message || 'Signup failed');
+  return json.data;
+}
+
+export async function getMe() {
+  const res = await fetch(`${API_BASE}/api/auth/me`, {
+    headers: getAuthHeaders(),
+  });
+  if (res.status === 401) return null;
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error || json.message || 'Request failed');
+  return json.data;
+}
+
+/** Current user's lookup stats and recent records (customer/internal). */
+export async function getMyStats() {
+  const res = await fetch(`${API_BASE}/api/users/me/stats`, {
+    headers: getAuthHeaders(),
+  });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error || json.message || 'Failed to load stats');
+  return json.data;
+}
+
+/** Change current user's password. */
+export async function changeMyPassword({ password }) {
+  const res = await fetch(`${API_BASE}/api/users/me`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({ password }),
+  });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error || json.message || 'Failed to update password');
+  return json;
+}
+
+export async function getAdminStats() {
+  const res = await fetch(`${API_BASE}/api/admin/stats`, {
+    headers: getAuthHeaders(),
+  });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error || json.message || 'Failed to load stats');
+  return json.data;
+}
+
+export async function getAdminUsers() {
+  const res = await fetch(`${API_BASE}/api/admin/users`, {
+    headers: getAuthHeaders(),
+  });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error || json.message || 'Failed to load users');
+  return json.data;
+}
+
+export async function createInternalUser({ email, password }) {
+  const res = await fetch(`${API_BASE}/api/admin/users`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({ email, password }),
+  });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error || json.message || 'Failed to create user');
+  return json.data;
+}
+
+export async function updateUser(id, { email, password }) {
+  const res = await fetch(`${API_BASE}/api/admin/users/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({ email, password }),
+  });
+  const json = await res.json();
+  if (!res.ok) throw new Error(json.error || json.message || 'Failed to update user');
+  return json.data;
+}
+
+export async function deleteUser(id) {
+  const res = await fetch(`${API_BASE}/api/admin/users/${id}`, {
+    method: 'DELETE',
+    headers: getAuthHeaders(),
+  });
+  if (!res.ok && res.status !== 204) {
+    let message = 'Failed to delete user';
+    try {
+      const json = await res.json();
+      message = json.error || json.message || message;
+    } catch {
+      // ignore
+    }
+    throw new Error(message);
+  }
+}
+
 export async function fetchPartNumber({ vin, cartName, skuQuery }) {
   const effectiveCart = (cartName && cartName.trim()) ? cartName.trim() : vin.trim();
   const res = await fetch(`${API_BASE}/api/vin-lookup`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({
       vin: vin.trim(),
       cartName: effectiveCart,
@@ -42,6 +170,7 @@ export function fetchPartNumberStreamViaWs({ vin, cartName, skuQuery }, { onStat
     cartName: effectiveCart,
     skuQuery: (skuQuery ?? '').trim(),
   });
+  if (authToken) params.set('token', authToken);
   const wsUrl = `${getWsBase()}/api/vin-lookup/ws?${params}`;
 
   return new Promise((resolve, reject) => {
@@ -109,7 +238,7 @@ export function fetchPartNumberStream({ vin, cartName, skuQuery }, { onStatus, o
     skuQuery: skuQuery.trim(),
   });
   return new Promise((resolve, reject) => {
-    fetch(`${API_BASE}/api/vin-lookup/stream?${params}`)
+    fetch(`${API_BASE}/api/vin-lookup/stream?${params}`, { headers: getAuthHeaders() })
       .then((res) => {
         if (!res.ok) {
           res.json().then((json) => {
@@ -164,7 +293,7 @@ export function fetchPartNumberStream({ vin, cartName, skuQuery }, { onStatus, o
 export async function submitSelection(jobId, selectedPart, partIndex) {
   const res = await fetch(`${API_BASE}/api/vin-lookup/stream/select`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({ jobId, selectedPart, partIndex }),
   });
   const json = await res.json();
@@ -176,7 +305,7 @@ export async function submitSelection(jobId, selectedPart, partIndex) {
 export async function submitSelections(jobId, selections) {
   const res = await fetch(`${API_BASE}/api/vin-lookup/stream/select`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({ jobId, selections }),
   });
   const json = await res.json();
@@ -187,7 +316,7 @@ export async function submitSelections(jobId, selections) {
 export async function submitStop(jobId) {
   const res = await fetch(`${API_BASE}/api/vin-lookup/stream/stop`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({ jobId }),
   });
   const json = await res.json();
@@ -203,7 +332,7 @@ export async function saveManualLookup({ vin, cartName, skuQuery, result }) {
   const effectiveCart = (cartName && cartName.trim()) ? cartName.trim() : vin.trim();
   const res = await fetch(`${API_BASE}/api/vin-lookup/save-manual`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({
       vin: vin.trim(),
       cartName: effectiveCart,

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { getTerminologyForPrompt } from "./part-terminology.js";
 
 export interface QueryExample {
   query: string;
@@ -79,10 +80,12 @@ export function getReferenceTextForPromptAsync(): string {
   const learned = loadLearnedExamples().map((e) => formatExample(e));
   const lines = [...builtin, ...learned].slice(-50);
   const treeContext = getDetailListTreeContext();
+  const terminology = getTerminologyForPrompt();
   return (
     "Reference examples of user queries and the parts they need (use these to improve your choices):\n" +
     lines.join("\n") +
-    (treeContext ? "\n\n" + treeContext : "")
+    (treeContext ? "\n\n" + treeContext : "") +
+    (terminology ? "\n\n" + terminology : "")
   );
 }
 

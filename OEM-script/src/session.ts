@@ -17,6 +17,12 @@ export async function needsLogin(page: Page): Promise<boolean> {
     .isVisible()
     .catch(() => false);
   if (dashboardVisible) return false;
+  const partSearchFormVisible = await page
+    .locator(selectors.vinForm.cartName)
+    .first()
+    .isVisible()
+    .catch(() => false);
+  if (partSearchFormVisible) return false;
   const modalVisible = await page
     .locator(selectors.modal.closeButton)
     .first()
@@ -26,6 +32,7 @@ export async function needsLogin(page: Page): Promise<boolean> {
   const race = await Promise.race([
     page.waitForSelector(selectors.login.userName, { state: 'visible', timeout: DETECT_TIMEOUT_MS }).then(() => true),
     page.waitForSelector(selectors.navigation.internationalTab, { state: 'visible', timeout: DETECT_TIMEOUT_MS }).then(() => false),
+    page.waitForSelector(selectors.vinForm.cartName, { state: 'visible', timeout: DETECT_TIMEOUT_MS }).then(() => false),
     page.waitForSelector(selectors.modal.closeButton, { state: 'visible', timeout: DETECT_TIMEOUT_MS }).then(() => false),
   ]).catch(() => true);
   return race;

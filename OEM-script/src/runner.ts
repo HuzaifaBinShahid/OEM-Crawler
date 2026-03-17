@@ -7,8 +7,9 @@ import { openDetailList } from './steps/detail-list.js';
 import { extractBuildSheet, type ExtractedData } from './steps/extract.js';
 import { findPartInDetailListByDescription, findPartViaSearchTab, searchAgainOnSamePage } from './steps/part-search.js';
 import { resolveDetailListParent } from './services/chassis-type-api.js';
-import { pickSuggestedPartFromSearchResults, extractPartNameForSearch, extractPartTermsFromQuery } from './services/ai-fallback.js';
+import { pickSuggestedPartFromSearchResults, extractPartNameForSearch, extractPartTermsFromQuery, suggestSearchTermForPart } from './services/ai-fallback.js';
 import { getReferenceTextForPromptAsync } from './data/query-examples.js';
+import { resolvePartTerm } from './data/part-terminology.js';
 import { login } from './steps/login.js';
 import { goToPartSearch } from './steps/navigation.js';
 import { submitVinSearch } from './steps/vin-form.js';
@@ -48,7 +49,7 @@ function throwIfAborted(abortSignal?: AbortSignal, workTimeoutAborted?: boolean)
 export interface VinLookupResult {
   vin: string;
   found: boolean;
-  parts: Array<{ sku?: string; description?: string; section?: string; compatibility?: string }>;
+  parts: Array<{ sku?: string; description?: string; section?: string; compatibility?: string; figureImageUrl?: string }>;
   buildSheet?: ExtractedData['buildSheet'];
   model?: string;
   engine?: string;
@@ -118,7 +119,7 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
     lastStep = 'navigation';
     status('Navigating to portal...');
     if (hasStoredState) {
-      await page.goto(config.dashboardUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeout });
+      await page.goto(config.partSearchUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeout });
     } else {
       await page.goto(config.loginUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeout });
     }
@@ -133,6 +134,7 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
     lastStep = 'modal';
     status('Closing modal...');
     await closePostLoginModal(page);
+    await page.goto(config.partSearchUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeout });
     await context.storageState({ path: config.sessionStatePath });
 
     let targetPage: Page = page;
@@ -150,20 +152,34 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
       terms = terms.map(stripQuantityForSearch).filter(Boolean);
       if (terms.length === 0) terms = [userQuery];
 
+      let searchTerms: string[];
+      if (config.openaiApiKey) {
+        searchTerms = [];
+        const refText = getReferenceTextForPromptAsync();
+        for (let i = 0; i < terms.length; i++) {
+          const term = terms[i]!;
+          status(`Checking if "${term}" is an actual part name or slang...`);
+          const suggested = await suggestSearchTermForPart(config.openaiApiKey, term, refText).catch(() => null);
+          searchTerms.push(suggested && suggested.trim() ? suggested.trim() : resolvePartTerm(term));
+        }
+      } else {
+        searchTerms = terms.map((t) => resolvePartTerm(t));
+      }
+
       if (terms.length > 1) {
         status('Opening part search...');
-        await goToPartSearch(page);
+        await goToPartSearch(page, config);
         status('Submitting VIN and opening catalog...');
         targetPage = await submitVinSearch(page, { cartName: options.cartName, vin: options.vin });
         currentPage = targetPage;
         await closeOnCommandMessageModal(targetPage);
 
-        status(`Searching for: "${terms[0]}"`);
-        const r0 = await findPartViaSearchTab(targetPage, terms[0]!, options.onStatus);
+        status(`Searching for: "${searchTerms[0]}"`);
+        const r0 = await findPartViaSearchTab(targetPage, searchTerms[0]!, options.onStatus);
         const results: Array<{ parts: typeof r0.parts; noMatch: boolean }> = [r0];
         for (let i = 1; i < terms.length; i++) {
-          status(`Searching for: "${terms[i]}"`);
-          const r = await searchAgainOnSamePage(targetPage, terms[i]!, options.onStatus);
+          status(`Searching for: "${searchTerms[i]}"`);
+          const r = await searchAgainOnSamePage(targetPage, searchTerms[i]!, options.onStatus);
           results.push(r);
         }
 
@@ -176,6 +192,7 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
             description: p.description,
             section: p.item,
             compatibility: p.servicePartNumber,
+            figureImageUrl: p.figureImageUrl,
           }));
           let suggestedPart: { sku: string } | undefined;
           if (config.openaiApiKey && parts.length > 0) {
@@ -308,7 +325,7 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
       } else {
         lastStep = 'goToPartSearch';
         status('Opening part search...');
-        await goToPartSearch(page);
+        await goToPartSearch(page, config);
         lastStep = 'submitVinSearch';
         status('Submitting VIN and opening catalog...');
         targetPage = await submitVinSearch(page, { cartName: options.cartName, vin: options.vin });
@@ -319,6 +336,12 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
         if (config.openaiApiKey) {
           const extracted = await extractPartNameForSearch(config.openaiApiKey, userQuery, getReferenceTextForPromptAsync()).catch(() => null);
           if (extracted) searchTerm = extracted;
+          status('Checking if this is an actual part name or slang...');
+          const suggested = await suggestSearchTermForPart(config.openaiApiKey, searchTerm, getReferenceTextForPromptAsync()).catch(() => null);
+          if (suggested && suggested.trim()) searchTerm = suggested.trim();
+          else searchTerm = resolvePartTerm(searchTerm);
+        } else {
+          searchTerm = resolvePartTerm(searchTerm);
         }
         status(`Searching parts for: "${searchTerm}"`);
         const searchResult = await findPartViaSearchTab(targetPage, searchTerm, options.onStatus);
@@ -328,12 +351,13 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
           description: p.description,
           section: p.item,
           compatibility: p.servicePartNumber,
+          figureImageUrl: p.figureImageUrl,
         }));
       }
     } else {
       lastStep = 'goToPartSearch';
       status('Opening part search...');
-      await goToPartSearch(page);
+      await goToPartSearch(page, config);
       lastStep = 'submitVinSearch';
       status('Submitting VIN and opening catalog...');
       targetPage = await submitVinSearch(page, { cartName: options.cartName, vin: options.vin });

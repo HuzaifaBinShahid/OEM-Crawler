@@ -5,6 +5,8 @@ import path from "node:path";
 export interface Config {
   loginUrl: string;
   dashboardUrl: string;
+  /** Direct URL to part search (cart + VIN) page; when set, used when already logged in and to open part search. */
+  partSearchUrl: string;
   navistarPortalBaseUrl: string;
   username: string;
   password: string;
@@ -17,6 +19,8 @@ export interface Config {
   postgresUrl: string;
   apiPort: number;
   openaiApiKey: string;
+  jwtSecret: string;
+  jwtExpiresIn: string;
 }
 
 function getEnv(name: string, fallback: string): string {
@@ -59,6 +63,10 @@ export function loadConfig(): Config {
       "REPAIRLINK_DASHBOARD_URL",
       "https://repairlinkshop.com/#/0",
     ),
+    partSearchUrl: getEnv(
+      "REPAIRLINK_PART_SEARCH_URL",
+      "https://repairlinkshop.com/HeavyDutyCatalog/PartSearch#/partlist/split/0",
+    ),
     navistarPortalBaseUrl: getEnv(
       "NAVISTAR_PORTAL_BASE_URL",
       "https://oecnpc.navistar.com",
@@ -77,5 +85,7 @@ export function loadConfig(): Config {
     ),
     apiPort: parseInt(getEnv("API_PORT", "3000"), 10) || 3000,
     openaiApiKey: getEnv("OPEN_AI_API_KEY", "") || getEnv("OPENAI_API_KEY", ""),
+    jwtSecret: getEnv("JWT_SECRET", "dev-secret-change-in-production"),
+    jwtExpiresIn: getEnv("JWT_EXPIRES_IN", "7d"),
   };
 }

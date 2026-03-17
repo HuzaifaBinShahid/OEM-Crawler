@@ -1,9 +1,11 @@
-function Loader({ progress = 0, message = 'Looking up parts…' }) {
+function Loader({ progress = 0, message = 'Looking up parts…', showProgress = true }) {
   return (
     <div className="loader-wrap">
-      <div className="progress-track">
-        <div className="progress-fill" style={{ width: `${progress}%` }} />
-      </div>
+      {showProgress && (
+        <div className="progress-track">
+          <div className="progress-fill" style={{ width: `${progress}%` }} />
+        </div>
+      )}
       <div className="loader">
         <span className="dot" />
         <span className="dot" />
