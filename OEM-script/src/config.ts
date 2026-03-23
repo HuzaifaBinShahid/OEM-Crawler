@@ -5,7 +5,6 @@ import path from "node:path";
 export interface Config {
   loginUrl: string;
   dashboardUrl: string;
-  /** Direct URL to part search (cart + VIN) page; when set, used when already logged in and to open part search. */
   partSearchUrl: string;
   navistarPortalBaseUrl: string;
   username: string;

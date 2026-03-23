@@ -42,20 +42,21 @@ export const selectors = {
     partsTableBody: "#partsTable tbody",
     partsTableRows: "#partsTable tbody tr",
     partsTableFilter: "#partsTable_filter input, .dataTables_filter input",
-    /** Related Parts link in OPTIONS column – opens modal with related parts table */
-    relatedPartsLink: "img.relatedURL.cursor-pointer, td.parts-options img.relatedURL",
-    /** Modal container and table for "Related Parts" */
+    relatedPartsLink:
+      "img.relatedURL.cursor-pointer, td.parts-options img.relatedURL",
     partOptionsModal: "#partOptionsContainer",
     partOptionsTable: "#partOptionsTable",
     partOptionsTableRows: "#partOptionsTable tbody tr",
-    /** Modal close (e.g. jQuery UI dialog close) */
-    partOptionsModalClose: ".ui-dialog-titlebar-close, #partOptionsContainer [data-dismiss='modal'], .modal-header button.close",
-    /** Parts table pagination (DataTables) */
+    partOptionsModalClose:
+      ".ui-dialog-titlebar-close, #partOptionsContainer [data-dismiss='modal'], .modal-header button.close",
     partsTablePaginate: "#partsTable_paginate",
-    partsTablePaginateNext: "#partsTable_paginate a.paginate_button.next:not(.disabled), #partsTable_next",
-    partsTablePaginatePrev: "#partsTable_paginate a.paginate_button.previous:not(.disabled), #partsTable_previous",
+    partsTablePaginateNext:
+      "#partsTable_paginate a.paginate_button.next:not(.disabled), #partsTable_next",
+    partsTablePaginatePrev:
+      "#partsTable_paginate a.paginate_button.previous:not(.disabled), #partsTable_previous",
     partsTablePaginateCurrent: "#partsTable_paginate a.paginate_button.current",
-    partsTablePaginateButtons: "#partsTable_paginate a.paginate_button[data-dt-idx]",
+    partsTablePaginateButtons:
+      "#partsTable_paginate a.paginate_button[data-dt-idx]",
   },
 
   buildSummary: {

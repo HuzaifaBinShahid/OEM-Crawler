@@ -1,47 +1,80 @@
-import fs from 'node:fs';
-import { chromium, type Page } from 'playwright';
-import { loadConfig } from './config.js';
-import { needsLogin } from './session.js';
-import { closePostLoginModal, closeOnCommandMessageModal } from './steps/modal.js';
-import { openDetailList } from './steps/detail-list.js';
-import { extractBuildSheet, type ExtractedData } from './steps/extract.js';
-import { findPartInDetailListByDescription, findPartViaSearchTab, searchAgainOnSamePage } from './steps/part-search.js';
-import { resolveDetailListParent } from './services/chassis-type-api.js';
-import { pickSuggestedPartFromSearchResults, extractPartNameForSearch, extractPartTermsFromQuery, suggestSearchTermForPart } from './services/ai-fallback.js';
-import { getReferenceTextForPromptAsync } from './data/query-examples.js';
-import { resolvePartTerm } from './data/part-terminology.js';
-import { login } from './steps/login.js';
-import { goToPartSearch } from './steps/navigation.js';
-import { submitVinSearch } from './steps/vin-form.js';
-import { logScraperError } from './services/error-handler.js';
-import { ScraperCancelledError, ScraperTimeoutError } from './scraper-cancelled-error.js';
+import fs from "node:fs";
+import { login } from "./steps/login.js";
+import { loadConfig } from "./config.js";
+import { needsLogin } from "./session.js";
+import { chromium, type Page } from "playwright";
+import { submitVinSearch } from "./steps/vin-form.js";
+import { goToPartSearch } from "./steps/navigation.js";
+import { openDetailList } from "./steps/detail-list.js";
+import { resolvePartTerm } from "./data/part-terminology.js";
+import { logScraperError } from "./services/error-handler.js";
+import { resolveDetailListParent } from "./services/chassis-type-api.js";
+import { getReferenceTextForPromptAsync, refreshDbExamples } from "./data/query-examples.js";
+import { extractBuildSheet, type ExtractedData } from "./steps/extract.js";
+import {
+  closePostLoginModal,
+  closeOnCommandMessageModal,
+} from "./steps/modal.js";
+import {
+  ScraperCancelledError,
+  ScraperTimeoutError,
+} from "./scraper-cancelled-error.js";
+import {
+  findPartInDetailListByDescription,
+  findPartViaSearchTab,
+  searchAgainOnSamePage,
+} from "./steps/part-search.js";
+import {
+  pickSuggestedPartFromSearchResults,
+  extractPartNameForSearch,
+  extractPartTermsFromQuery,
+  suggestSearchTermForPart,
+} from "./services/ai-fallback.js";
 
 function stripQuantityForSearch(term: string): string {
   const t = term.trim();
-  const out = t.replace(/^\s*\d+\s*(x\s*\d*)?\s*/i, '').replace(/^\s*x\s*\d*\s*/i, '').trim();
+  const out = t
+    .replace(/^\s*\d+\s*(x\s*\d*)?\s*/i, "")
+    .replace(/^\s*x\s*\d*\s*/i, "")
+    .trim();
   return out || t;
 }
 
 export type SelectionOutcome =
-  | { selectedPart: VinLookupResult['parts'][0]; partIndex?: number }
-  | { selections: Array<{ termIndex: number; selectedPart: VinLookupResult['parts'][0] }> }
+  | { selectedPart: VinLookupResult["parts"][0]; partIndex?: number }
+  | {
+      selections: Array<{
+        termIndex: number;
+        selectedPart: VinLookupResult["parts"][0];
+      }>;
+    }
   | { stop: true };
 
 export interface RunVinLookupOptions {
   vin: string;
   cartName: string;
   skuQuery?: string;
+  userRole?: "admin" | "internal" | "customer";
   onStatus?: (message: string) => void;
   jobId?: string;
-  /** When aborted (e.g. user clicked Stop during detail list), scraper should throw ScraperCancelledError. */
   abortSignal?: AbortSignal;
-  /** Max ms for active scraping (navigation, search, detail list). Not applied while awaiting user selection. */
   scraperTimeoutMs?: number;
-  onAwaitingSelection?: (payload: { parts?: VinLookupResult['parts']; suggestedPart?: { sku: string }; partsPerTerm?: Array<{ term: string; parts: VinLookupResult['parts']; suggestedPart?: { sku: string } }> }) => void;
+  onAwaitingSelection?: (payload: {
+    parts?: VinLookupResult["parts"];
+    suggestedPart?: { sku: string };
+    partsPerTerm?: Array<{
+      term: string;
+      parts: VinLookupResult["parts"];
+      suggestedPart?: { sku: string };
+    }>;
+  }) => void;
   waitForSelection?: () => Promise<SelectionOutcome>;
 }
 
-function throwIfAborted(abortSignal?: AbortSignal, workTimeoutAborted?: boolean): void {
+function throwIfAborted(
+  abortSignal?: AbortSignal,
+  workTimeoutAborted?: boolean,
+): void {
   if (workTimeoutAborted) throw new ScraperTimeoutError();
   if (abortSignal?.aborted) throw new ScraperCancelledError();
 }
@@ -49,8 +82,14 @@ function throwIfAborted(abortSignal?: AbortSignal, workTimeoutAborted?: boolean)
 export interface VinLookupResult {
   vin: string;
   found: boolean;
-  parts: Array<{ sku?: string; description?: string; section?: string; compatibility?: string; figureImageUrl?: string }>;
-  buildSheet?: ExtractedData['buildSheet'];
+  parts: Array<{
+    sku?: string;
+    description?: string;
+    section?: string;
+    compatibility?: string;
+    figureImageUrl?: string;
+  }>;
+  buildSheet?: ExtractedData["buildSheet"];
   model?: string;
   engine?: string;
   responseTimeMs: number;
@@ -60,8 +99,12 @@ export interface VinLookupResult {
   cancelled?: boolean;
 }
 
-export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLookupResult> {
+export async function runVinLookup(
+  options: RunVinLookupOptions,
+): Promise<VinLookupResult> {
   const start = Date.now();
+  // Pre-load DB examples from internal/admin user lookups for AI prompts
+  await refreshDbExamples().catch(() => {});
   const config = loadConfig();
   const result: VinLookupResult = {
     vin: options.vin,
@@ -71,9 +114,8 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
     cached: false,
   };
 
-  /** Send status to frontend (if streaming) and log to terminal. */
   const status = (message: string) => {
-    console.log('[vin-lookup]', message);
+    console.log("[vin-lookup]", message);
     options.onStatus?.(message);
   };
 
@@ -81,15 +123,15 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
 
   const browser = await chromium.launch({
     headless: false,
-    args: ['--disable-blink-features=AutomationControlled'],
+    args: ["--disable-blink-features=AutomationControlled"],
   });
 
   options.abortSignal?.addEventListener(
-    'abort',
+    "abort",
     () => {
       browser.close().catch(() => {});
     },
-    { once: true }
+    { once: true },
   );
 
   const context = await browser.newContext({
@@ -98,7 +140,7 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
 
   const page = await context.newPage();
   let currentPage: Page = page;
-  let lastStep = 'init';
+  let lastStep = "init";
 
   let workTimeoutId: ReturnType<typeof setTimeout> | null = null;
   let workTimeoutController: AbortController | null = null;
@@ -111,42 +153,53 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
     disarmWorkTimeout();
     if (!options.scraperTimeoutMs) return;
     workTimeoutController = new AbortController();
-    workTimeoutId = setTimeout(() => workTimeoutController!.abort(), options.scraperTimeoutMs);
+    workTimeoutId = setTimeout(
+      () => workTimeoutController!.abort(),
+      options.scraperTimeoutMs,
+    );
   }
 
   try {
     armWorkTimeout();
-    lastStep = 'navigation';
-    status('Navigating to portal...');
-    if (hasStoredState) {
-      await page.goto(config.partSearchUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeout });
-    } else {
-      await page.goto(config.loginUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeout });
-    }
+    lastStep = "navigation";
+    status("Navigating to portal...");
+    const initialUrl = hasStoredState ? config.dashboardUrl : config.loginUrl;
+    await page.goto(initialUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: config.navigationTimeout,
+    });
 
     if (await needsLogin(page)) {
-      lastStep = 'login';
-      status('Logging in...');
-      await page.goto(config.loginUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeout });
+      lastStep = "login";
+      status("Logging in...");
       await login(page, config);
+      await context.storageState({ path: config.sessionStatePath });
     }
 
-    lastStep = 'modal';
-    status('Closing modal...');
+    lastStep = "modal";
+    status("Closing modal...");
     await closePostLoginModal(page);
-    await page.goto(config.partSearchUrl, { waitUntil: 'domcontentloaded', timeout: config.navigationTimeout });
     await context.storageState({ path: config.sessionStatePath });
 
     let targetPage: Page = page;
 
-    let searchParts: Array<{ sku?: string; description?: string; section?: string; compatibility?: string }> | null = null;
+    let searchParts: Array<{
+      sku?: string;
+      description?: string;
+      section?: string;
+      compatibility?: string;
+    }> | null = null;
     let searchNoMatch = false;
 
     if (options.skuQuery?.trim()) {
-      lastStep = 'findPartViaSearchTab';
+      lastStep = "findPartViaSearchTab";
       const userQuery = options.skuQuery.trim();
       let terms: string[] = config.openaiApiKey
-        ? await extractPartTermsFromQuery(config.openaiApiKey, userQuery, getReferenceTextForPromptAsync()).catch(() => [userQuery])
+        ? await extractPartTermsFromQuery(
+            config.openaiApiKey,
+            userQuery,
+            getReferenceTextForPromptAsync(),
+          ).catch(() => [userQuery])
         : [userQuery];
       if (terms.length === 0) terms = [userQuery];
       terms = terms.map(stripQuantityForSearch).filter(Boolean);
@@ -159,32 +212,57 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
         for (let i = 0; i < terms.length; i++) {
           const term = terms[i]!;
           status(`Checking if "${term}" is an actual part name or slang...`);
-          const suggested = await suggestSearchTermForPart(config.openaiApiKey, term, refText).catch(() => null);
-          searchTerms.push(suggested && suggested.trim() ? suggested.trim() : resolvePartTerm(term));
+          const suggested = await suggestSearchTermForPart(
+            config.openaiApiKey,
+            term,
+            refText,
+          ).catch(() => null);
+          searchTerms.push(
+            suggested && suggested.trim()
+              ? suggested.trim()
+              : resolvePartTerm(term),
+          );
         }
       } else {
         searchTerms = terms.map((t) => resolvePartTerm(t));
       }
 
       if (terms.length > 1) {
-        status('Opening part search...');
-        await goToPartSearch(page, config);
-        status('Submitting VIN and opening catalog...');
-        targetPage = await submitVinSearch(page, { cartName: options.cartName, vin: options.vin });
+        status("Opening part search...");
+        await goToPartSearch(page);
+        status("Submitting VIN and opening catalog...");
+        targetPage = await submitVinSearch(page, {
+          cartName: options.cartName,
+          vin: options.vin,
+        });
         currentPage = targetPage;
         await closeOnCommandMessageModal(targetPage);
 
         status(`Searching for: "${searchTerms[0]}"`);
-        const r0 = await findPartViaSearchTab(targetPage, searchTerms[0]!, options.onStatus);
-        const results: Array<{ parts: typeof r0.parts; noMatch: boolean }> = [r0];
+        const r0 = await findPartViaSearchTab(
+          targetPage,
+          searchTerms[0]!,
+          options.onStatus,
+        );
+        const results: Array<{ parts: typeof r0.parts; noMatch: boolean }> = [
+          r0,
+        ];
         for (let i = 1; i < terms.length; i++) {
           status(`Searching for: "${searchTerms[i]}"`);
-          const r = await searchAgainOnSamePage(targetPage, searchTerms[i]!, options.onStatus);
+          const r = await searchAgainOnSamePage(
+            targetPage,
+            searchTerms[i]!,
+            options.onStatus,
+          );
           results.push(r);
         }
 
         const refText = getReferenceTextForPromptAsync();
-        const partsPerTerm: Array<{ term: string; parts: VinLookupResult['parts']; suggestedPart?: { sku: string } }> = [];
+        const partsPerTerm: Array<{
+          term: string;
+          parts: VinLookupResult["parts"];
+          suggestedPart?: { sku: string };
+        }> = [];
         for (let i = 0; i < terms.length; i++) {
           const r = results[i]!;
           const parts = r.parts.map((p) => ({
@@ -199,7 +277,11 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
             const sku = await pickSuggestedPartFromSearchResults(
               config.openaiApiKey,
               terms[i]!,
-              r.parts.map((p) => ({ partNumber: p.partNumber, description: p.description, item: p.item })),
+              r.parts.map((p) => ({
+                partNumber: p.partNumber,
+                description: p.description,
+                item: p.item,
+              })),
               refText,
             ).catch(() => null);
             if (sku) suggestedPart = { sku };
@@ -212,19 +294,26 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
           disarmWorkTimeout();
           const selection = await options.waitForSelection();
           armWorkTimeout();
-          if ('stop' in selection && selection.stop) {
+          if ("stop" in selection && selection.stop) {
             result.cancelled = true;
             result.responseTimeMs = Date.now() - start;
             return result;
           }
 
-          if ('selections' in selection && Array.isArray(selection.selections) && selection.selections.length > 0) {
-            lastStep = 'openDetailList';
-            status('Opening detail list...');
-            throwIfAborted(options.abortSignal, workTimeoutController?.signal.aborted);
+          if (
+            "selections" in selection &&
+            Array.isArray(selection.selections) &&
+            selection.selections.length > 0
+          ) {
+            lastStep = "openDetailList";
+            status("Opening detail list...");
+            throwIfAborted(
+              options.abortSignal,
+              workTimeoutController?.signal.aborted,
+            );
             await openDetailList(targetPage);
-            lastStep = 'extractBuildSheet';
-            status('Extracting build sheet...');
+            lastStep = "extractBuildSheet";
+            status("Extracting build sheet...");
             const extracted = await extractBuildSheet(targetPage);
             result.vin = extracted.vin || options.vin;
             result.buildSheet = extracted.buildSheet;
@@ -233,25 +322,36 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
             result.scrapedAt = extracted.scrapedAt;
             const vinForResolve = extracted.vin || options.vin;
 
-            const resultParts: VinLookupResult['parts'] = [];
+            const resultParts: VinLookupResult["parts"] = [];
             for (let i = 0; i < selection.selections.length; i++) {
               const { selectedPart } = selection.selections[i]!;
-              const preferred = await resolveDetailListParent(vinForResolve, {
-                partNumber: selectedPart.sku ?? '',
-                description: selectedPart.description ?? '',
-              }, { fetchLike: (url) => targetPage.request.get(url) }).catch(() => null);
+              const preferred = await resolveDetailListParent(
+                vinForResolve,
+                {
+                  partNumber: selectedPart.sku ?? "",
+                  description: selectedPart.description ?? "",
+                },
+                { fetchLike: (url) => targetPage.request.get(url) },
+              ).catch(() => null);
               if (preferred) {
-                status(`Looking in category: ${preferred.parentName}${preferred.subcategoryName ? ` > ${preferred.subcategoryName}` : ''}`);
+                status(
+                  `Looking in category: ${preferred.parentName}${preferred.subcategoryName ? ` > ${preferred.subcategoryName}` : ""}`,
+                );
               } else {
-                status('Could not resolve category from catalog API; using AI to pick category.');
+                status(
+                  "Could not resolve category from catalog API; using AI to pick category.",
+                );
               }
               status(`Searching for selected part ${i + 1} in detail list...`);
-              throwIfAborted(options.abortSignal, workTimeoutController?.signal.aborted);
+              throwIfAborted(
+                options.abortSignal,
+                workTimeoutController?.signal.aborted,
+              );
               const match = await findPartInDetailListByDescription(
                 targetPage,
                 {
-                  partNumber: selectedPart.sku ?? '',
-                  description: selectedPart.description ?? '',
+                  partNumber: selectedPart.sku ?? "",
+                  description: selectedPart.description ?? "",
                   servicePartNumber: selectedPart.compatibility,
                 },
                 options.onStatus,
@@ -273,12 +373,15 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
 
           const partIndex = selection.partIndex ?? 0;
           const selectedPart = selection.selectedPart;
-          lastStep = 'openDetailList';
-          status('Opening detail list...');
-          throwIfAborted(options.abortSignal, workTimeoutController?.signal.aborted);
+          lastStep = "openDetailList";
+          status("Opening detail list...");
+          throwIfAborted(
+            options.abortSignal,
+            workTimeoutController?.signal.aborted,
+          );
           await openDetailList(targetPage);
-          lastStep = 'extractBuildSheet';
-          status('Extracting build sheet...');
+          lastStep = "extractBuildSheet";
+          status("Extracting build sheet...");
           const extracted = await extractBuildSheet(targetPage);
           result.vin = extracted.vin || options.vin;
           result.buildSheet = extracted.buildSheet;
@@ -286,22 +389,33 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
           result.engine = extracted.engine;
           result.scrapedAt = extracted.scrapedAt;
           const vinForResolve = extracted.vin || options.vin;
-          const preferred = await resolveDetailListParent(vinForResolve, {
-            partNumber: selectedPart.sku ?? '',
-            description: selectedPart.description ?? '',
-          }, { fetchLike: (url) => targetPage.request.get(url) }).catch(() => null);
+          const preferred = await resolveDetailListParent(
+            vinForResolve,
+            {
+              partNumber: selectedPart.sku ?? "",
+              description: selectedPart.description ?? "",
+            },
+            { fetchLike: (url) => targetPage.request.get(url) },
+          ).catch(() => null);
           if (preferred) {
-            status(`Looking in category: ${preferred.parentName}${preferred.subcategoryName ? ` > ${preferred.subcategoryName}` : ''}`);
+            status(
+              `Looking in category: ${preferred.parentName}${preferred.subcategoryName ? ` > ${preferred.subcategoryName}` : ""}`,
+            );
           } else {
-            status('Could not resolve category from catalog API; using AI to pick category.');
+            status(
+              "Could not resolve category from catalog API; using AI to pick category.",
+            );
           }
-          status('Searching for selected part in detail list...');
-          throwIfAborted(options.abortSignal, workTimeoutController?.signal.aborted);
+          status("Searching for selected part in detail list...");
+          throwIfAborted(
+            options.abortSignal,
+            workTimeoutController?.signal.aborted,
+          );
           const match = await findPartInDetailListByDescription(
             targetPage,
             {
-              partNumber: selectedPart.sku ?? '',
-              description: selectedPart.description ?? '',
+              partNumber: selectedPart.sku ?? "",
+              description: selectedPart.description ?? "",
               servicePartNumber: selectedPart.compatibility,
             },
             options.onStatus,
@@ -323,28 +437,43 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
         searchNoMatch = results.every((r) => r.noMatch);
         searchParts = partsPerTerm.flatMap((x) => x.parts);
       } else {
-        lastStep = 'goToPartSearch';
-        status('Opening part search...');
-        await goToPartSearch(page, config);
-        lastStep = 'submitVinSearch';
-        status('Submitting VIN and opening catalog...');
-        targetPage = await submitVinSearch(page, { cartName: options.cartName, vin: options.vin });
+        lastStep = "goToPartSearch";
+        status("Opening part search...");
+        await goToPartSearch(page);
+        lastStep = "submitVinSearch";
+        status("Submitting VIN and opening catalog...");
+        targetPage = await submitVinSearch(page, {
+          cartName: options.cartName,
+          vin: options.vin,
+        });
         currentPage = targetPage;
-        lastStep = 'closeOnCommandMessageModal';
+        lastStep = "closeOnCommandMessageModal";
         await closeOnCommandMessageModal(targetPage);
         let searchTerm = terms[0] ?? userQuery;
         if (config.openaiApiKey) {
-          const extracted = await extractPartNameForSearch(config.openaiApiKey, userQuery, getReferenceTextForPromptAsync()).catch(() => null);
+          const extracted = await extractPartNameForSearch(
+            config.openaiApiKey,
+            userQuery,
+            getReferenceTextForPromptAsync(),
+          ).catch(() => null);
           if (extracted) searchTerm = extracted;
-          status('Checking if this is an actual part name or slang...');
-          const suggested = await suggestSearchTermForPart(config.openaiApiKey, searchTerm, getReferenceTextForPromptAsync()).catch(() => null);
+          status("Checking if this is an actual part name or slang...");
+          const suggested = await suggestSearchTermForPart(
+            config.openaiApiKey,
+            searchTerm,
+            getReferenceTextForPromptAsync(),
+          ).catch(() => null);
           if (suggested && suggested.trim()) searchTerm = suggested.trim();
           else searchTerm = resolvePartTerm(searchTerm);
         } else {
           searchTerm = resolvePartTerm(searchTerm);
         }
         status(`Searching parts for: "${searchTerm}"`);
-        const searchResult = await findPartViaSearchTab(targetPage, searchTerm, options.onStatus);
+        const searchResult = await findPartViaSearchTab(
+          targetPage,
+          searchTerm,
+          options.onStatus,
+        );
         searchNoMatch = searchResult.noMatch;
         searchParts = searchResult.parts.map((p) => ({
           sku: p.partNumber,
@@ -355,27 +484,30 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
         }));
       }
     } else {
-      lastStep = 'goToPartSearch';
-      status('Opening part search...');
-      await goToPartSearch(page, config);
-      lastStep = 'submitVinSearch';
-      status('Submitting VIN and opening catalog...');
-      targetPage = await submitVinSearch(page, { cartName: options.cartName, vin: options.vin });
+      lastStep = "goToPartSearch";
+      status("Opening part search...");
+      await goToPartSearch(page);
+      lastStep = "submitVinSearch";
+      status("Submitting VIN and opening catalog...");
+      targetPage = await submitVinSearch(page, {
+        cartName: options.cartName,
+        vin: options.vin,
+      });
       currentPage = targetPage;
-      lastStep = 'closeOnCommandMessageModal';
+      lastStep = "closeOnCommandMessageModal";
       await closeOnCommandMessageModal(targetPage);
     }
 
     if (searchParts && searchParts.length > 0 && options.waitForSelection) {
       let suggestedPart: { sku: string } | undefined;
       if (config.openaiApiKey) {
-        status('Asking AI which part is most likely correct...');
+        status("Asking AI which part is most likely correct...");
         const suggestedSku = await pickSuggestedPartFromSearchResults(
           config.openaiApiKey,
           options.skuQuery!.trim(),
           searchParts.map((p) => ({
-            partNumber: p.sku ?? '',
-            description: p.description ?? '',
+            partNumber: p.sku ?? "",
+            description: p.description ?? "",
             item: p.section,
           })),
           getReferenceTextForPromptAsync(),
@@ -386,7 +518,7 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
       disarmWorkTimeout();
       const selection = await options.waitForSelection();
       armWorkTimeout();
-      if ('stop' in selection && selection.stop) {
+      if ("stop" in selection && selection.stop) {
         result.cancelled = true;
         result.responseTimeMs = Date.now() - start;
         if (targetPage !== page) {
@@ -395,12 +527,15 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
         return result;
       }
       const selectedPart = selection.selectedPart;
-      lastStep = 'openDetailList';
-      status('Opening detail list...');
-      throwIfAborted(options.abortSignal, workTimeoutController?.signal.aborted);
+      lastStep = "openDetailList";
+      status("Opening detail list...");
+      throwIfAborted(
+        options.abortSignal,
+        workTimeoutController?.signal.aborted,
+      );
       await openDetailList(targetPage);
-      lastStep = 'extractBuildSheet';
-      status('Extracting build sheet...');
+      lastStep = "extractBuildSheet";
+      status("Extracting build sheet...");
       const extracted = await extractBuildSheet(targetPage);
       result.vin = extracted.vin || options.vin;
       result.buildSheet = extracted.buildSheet;
@@ -408,24 +543,35 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
       result.engine = extracted.engine;
       result.scrapedAt = extracted.scrapedAt;
       const vinForResolve = extracted.vin || options.vin;
-      const preferred = await resolveDetailListParent(vinForResolve, {
-        partNumber: selectedPart.sku ?? '',
-        description: selectedPart.description ?? '',
-      }, {
-        fetchLike: (url) => targetPage.request.get(url),
-      }).catch(() => null);
+      const preferred = await resolveDetailListParent(
+        vinForResolve,
+        {
+          partNumber: selectedPart.sku ?? "",
+          description: selectedPart.description ?? "",
+        },
+        {
+          fetchLike: (url) => targetPage.request.get(url),
+        },
+      ).catch(() => null);
       if (preferred) {
-        status(`Looking in category: ${preferred.parentName}${preferred.subcategoryName ? ` > ${preferred.subcategoryName}` : ''}`);
+        status(
+          `Looking in category: ${preferred.parentName}${preferred.subcategoryName ? ` > ${preferred.subcategoryName}` : ""}`,
+        );
       } else {
-        status('Could not resolve category from catalog API; using AI to pick category.');
+        status(
+          "Could not resolve category from catalog API; using AI to pick category.",
+        );
       }
-      status('Searching for selected part in detail list...');
-      throwIfAborted(options.abortSignal, workTimeoutController?.signal.aborted);
+      status("Searching for selected part in detail list...");
+      throwIfAborted(
+        options.abortSignal,
+        workTimeoutController?.signal.aborted,
+      );
       const match = await findPartInDetailListByDescription(
         targetPage,
         {
-          partNumber: selectedPart.sku ?? '',
-          description: selectedPart.description ?? '',
+          partNumber: selectedPart.sku ?? "",
+          description: selectedPart.description ?? "",
           servicePartNumber: selectedPart.compatibility,
         },
         options.onStatus,
@@ -447,13 +593,13 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
       return result;
     }
 
-    lastStep = 'openDetailList';
-    status('Opening detail list...');
+    lastStep = "openDetailList";
+    status("Opening detail list...");
     throwIfAborted(options.abortSignal, workTimeoutController?.signal.aborted);
     await openDetailList(targetPage);
 
-    lastStep = 'extractBuildSheet';
-    status('Extracting build sheet...');
+    lastStep = "extractBuildSheet";
+    status("Extracting build sheet...");
     const extracted = await extractBuildSheet(targetPage);
 
     result.vin = extracted.vin || options.vin;
@@ -468,7 +614,8 @@ export async function runVinLookup(options: RunVinLookupOptions): Promise<VinLoo
       result.noMatch = searchNoMatch;
     } else {
       result.parts = extracted.parts;
-      result.found = extracted.buildSheet.length > 0 || extracted.parts.length > 0;
+      result.found =
+        extracted.buildSheet.length > 0 || extracted.parts.length > 0;
     }
     result.responseTimeMs = Date.now() - start;
 

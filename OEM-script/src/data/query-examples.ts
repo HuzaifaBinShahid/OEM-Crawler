@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { getTerminologyForPrompt } from "./part-terminology.js";
+import type { UserRole } from "../auth/user-repo.js";
+import { getInternalUserLookups, type DbLearnedLookup } from "../db/vin-lookup-repo.js";
 
 export interface QueryExample {
   query: string;
@@ -65,6 +67,51 @@ const BUILTIN_EXAMPLES: QueryExample[] = [
 
 const REFERENCE_FILE = "storage/ai-reference.json";
 
+/** In-memory cache for DB-sourced examples (refreshed via refreshDbExamples). */
+let cachedDbExamples: string[] = [];
+const DB_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+let dbCacheTimestamp = 0;
+
+function formatDbLookup(row: DbLearnedLookup): string {
+  const query = row.query_sku_query;
+  const result = row.result;
+  const parts = result?.parts ?? [];
+  if (parts.length === 0) return "";
+
+  const partsSummary = parts
+    .map((p) => {
+      let s = p.sku ?? "unknown";
+      if (p.description) s += ` (${p.description})`;
+      if (p.section) s += ` [section: ${p.section}]`;
+      if (p.compatibility) s += ` [compat: ${p.compatibility}]`;
+      return s;
+    })
+    .join(", ");
+
+  let line = `Query: "${query}" -> VIN: ${row.query_vin} | Parts: ${partsSummary}`;
+  if (result.model) line += ` | Model: ${result.model}`;
+  if (result.engine) line += ` | Engine: ${result.engine}`;
+  return line;
+}
+
+/**
+ * Refresh DB examples cache. Call this before building AI prompts.
+ * Uses a TTL so it won't query the DB on every single request.
+ */
+export async function refreshDbExamples(): Promise<void> {
+  const now = Date.now();
+  if (now - dbCacheTimestamp < DB_CACHE_TTL_MS && cachedDbExamples.length > 0) return;
+  try {
+    const rows = await getInternalUserLookups(200);
+    cachedDbExamples = rows
+      .map((r) => formatDbLookup(r))
+      .filter((line) => line.length > 0);
+    dbCacheTimestamp = now;
+  } catch {
+    // DB unavailable — keep stale cache or empty
+  }
+}
+
 export function getBuiltinExamples(): QueryExample[] {
   return [...BUILTIN_EXAMPLES];
 }
@@ -78,15 +125,26 @@ export function getReferenceTextForPrompt(): string {
 export function getReferenceTextForPromptAsync(): string {
   const builtin = getBuiltinExamples().map((e) => formatExample(e));
   const learned = loadLearnedExamples().map((e) => formatExample(e));
-  const lines = [...builtin, ...learned].slice(-50);
+  const fileLines = [...builtin, ...learned].slice(-50);
   const treeContext = getDetailListTreeContext();
   const terminology = getTerminologyForPrompt();
-  return (
+
+  // Include DB-sourced examples from internal/admin users (last 50)
+  const dbLines = cachedDbExamples.slice(-50);
+
+  let text =
     "Reference examples of user queries and the parts they need (use these to improve your choices):\n" +
-    lines.join("\n") +
-    (treeContext ? "\n\n" + treeContext : "") +
-    (terminology ? "\n\n" + terminology : "")
-  );
+    fileLines.join("\n");
+
+  if (dbLines.length > 0) {
+    text +=
+      "\n\nPast successful lookups from internal users (use these for better part matching):\n" +
+      dbLines.join("\n");
+  }
+
+  if (treeContext) text += "\n\n" + treeContext;
+  if (terminology) text += "\n\n" + terminology;
+  return text;
 }
 
 export function getDetailListTreeContext(): string {
@@ -130,8 +188,10 @@ export function loadLearnedExamples(): QueryExample[] {
 export function appendLearnedExample(
   query: string,
   answer: string,
-  context?: { category?: string; subcategories?: string[] }
+  context?: { category?: string; subcategories?: string[] },
+  userRole?: UserRole,
 ): void {
+  if (userRole && userRole !== "admin" && userRole !== "internal") return;
   try {
     const file = path.resolve(process.cwd(), REFERENCE_FILE);
     const dir = path.dirname(file);

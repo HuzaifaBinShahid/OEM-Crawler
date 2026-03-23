@@ -1,7 +1,3 @@
-/**
- * AbortController per job so the scraper can be stopped immediately when the user
- * clicks Stop, including during the detail-list phase (after selection was submitted).
- */
 const cancelControllers = new Map<string, AbortController>();
 
 export function registerJobCancel(jobId: string): AbortSignal {

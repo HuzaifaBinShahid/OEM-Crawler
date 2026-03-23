@@ -35,7 +35,7 @@ export async function getDashboardStats(): Promise<DashboardStats> {
       COUNT(*) FILTER (WHERE role = 'internal')::text AS internal,
       COUNT(*) FILTER (WHERE role = 'customer')::text AS customer
     FROM users
-  `
+  `,
   );
 
   const usersRow = usersResult.rows[0] ?? {
@@ -53,14 +53,15 @@ export async function getDashboardStats(): Promise<DashboardStats> {
   };
 
   const lookupsTotalResult = await pool.query<{ total: string }>(
-    "SELECT COUNT(*)::text AS total FROM vin_lookups"
+    "SELECT COUNT(*)::text AS total FROM vin_lookups",
   );
   const totalLookups = Number(lookupsTotalResult.rows[0]?.total ?? "0") || 0;
 
   const lookupsLast7Result = await pool.query<{ total: string }>(
-    "SELECT COUNT(*)::text AS total FROM vin_lookups WHERE created_at >= NOW() - INTERVAL '7 days'"
+    "SELECT COUNT(*)::text AS total FROM vin_lookups WHERE created_at >= NOW() - INTERVAL '7 days'",
   );
-  const lookupsLast7Days = Number(lookupsLast7Result.rows[0]?.total ?? "0") || 0;
+  const lookupsLast7Days =
+    Number(lookupsLast7Result.rows[0]?.total ?? "0") || 0;
 
   const lookupsByDayResult = await pool.query<{ day: string; count: string }>(
     `
@@ -71,7 +72,7 @@ export async function getDashboardStats(): Promise<DashboardStats> {
       WHERE created_at >= NOW() - INTERVAL '30 days'
       GROUP BY DATE(created_at)
       ORDER BY DATE(created_at)
-    `
+    `,
   );
 
   const lookupsByDay: LookupsByDay = lookupsByDayResult.rows.map((row) => ({
@@ -87,4 +88,3 @@ export async function getDashboardStats(): Promise<DashboardStats> {
     lookupsByDay,
   };
 }
-

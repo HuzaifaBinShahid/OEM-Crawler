@@ -1,6 +1,6 @@
-import type { Page } from 'playwright';
-import { selectors } from '../selectors.js';
-import { sleep } from '../utils/sleep.js';
+import type { Page } from "playwright";
+import { sleep } from "../utils/sleep.js";
+import { selectors } from "../selectors.js";
 
 export interface BuildSheetRow {
   grp?: string;
@@ -24,24 +24,25 @@ const { buildSummary: sumSel, buildList: listSel } = selectors;
 
 export async function extractBuildSheet(page: Page): Promise<ExtractedData> {
   const scrapedAt = new Date().toISOString();
-  let vin = '';
-  let model = '';
-  let engine = '';
-  let transmission = '';
+  let vin = "";
+  let model = "";
+  let engine = "";
+  let transmission = "";
   const buildSheet: BuildSheetRow[] = [];
-  const parts: Array<{ sku?: string; description?: string; section?: string }> = [];
+  const parts: Array<{ sku?: string; description?: string; section?: string }> =
+    [];
 
   const summarySection = page.locator(sumSel.container).first();
   const summaryVisible = await summarySection.isVisible().catch(() => false);
   if (summaryVisible) {
-    const table = summarySection.locator('..').locator('table').first();
+    const table = summarySection.locator("..").locator("table").first();
     const tableVisible = await table.isVisible().catch(() => false);
     if (tableVisible) {
-      const rows = await table.locator('tr').all();
+      const rows = await table.locator("tr").all();
       for (const row of rows) {
-        const cells = await row.locator('td, th').allTextContents();
+        const cells = await row.locator("td, th").allTextContents();
         if (cells.length >= 2) {
-          const key = cells[0]!.trim().replace(/\s*:\s*$/, '');
+          const key = cells[0]!.trim().replace(/\s*:\s*$/, "");
           const value = cells[1]!.trim();
           buildSheet.push({ [key]: value } as BuildSheetRow);
           if (/vin|vehicle.*number/i.test(key)) vin = value;
@@ -58,21 +59,23 @@ export async function extractBuildSheet(page: Page): Promise<ExtractedData> {
   const listSection = page.locator(listSel.container).first();
   const listVisible = await listSection.isVisible().catch(() => false);
   if (listVisible) {
-    const table = listSection.locator('..').locator('table').first();
+    const table = listSection.locator("..").locator("table").first();
     const tableVisible = await table.isVisible().catch(() => false);
     if (tableVisible) {
       const changeLengthSelect = page.locator(listSel.paginationSelect).first();
-      const selectVisible = await changeLengthSelect.isVisible().catch(() => false);
+      const selectVisible = await changeLengthSelect
+        .isVisible()
+        .catch(() => false);
       if (selectVisible) {
-        await changeLengthSelect.selectOption('50').catch(() => {});
+        await changeLengthSelect.selectOption("50").catch(() => {});
         await sleep(500);
       }
 
       let hasNext = true;
       while (hasNext) {
-        const rows = await table.locator('tbody tr').all();
+        const rows = await table.locator("tbody tr").all();
         for (const row of rows) {
-          const tds = await row.locator('td').allTextContents();
+          const tds = await row.locator("td").allTextContents();
           if (tds.length >= 3) {
             buildSheet.push({
               grp: tds[0]?.trim(),
@@ -89,7 +92,11 @@ export async function extractBuildSheet(page: Page): Promise<ExtractedData> {
 
         const nextBtn = page.locator(listSel.paginationNext).first();
         const nextVisible = await nextBtn.isVisible().catch(() => false);
-        const nextDisabled = nextVisible ? await nextBtn.getAttribute('class').then((c) => /disabled/.test(c ?? '')) : true;
+        const nextDisabled = nextVisible
+          ? await nextBtn
+              .getAttribute("class")
+              .then((c) => /disabled/.test(c ?? ""))
+          : true;
         if (!nextVisible || nextDisabled) {
           hasNext = false;
         } else {
@@ -101,8 +108,11 @@ export async function extractBuildSheet(page: Page): Promise<ExtractedData> {
   }
 
   if (!vin && buildSheet.length > 0) {
-    const first = buildSheet.find((r) => r.vin || (r as Record<string, string>)['VIN NUMBER']);
-    if (first) vin = (first as Record<string, string>)['VIN NUMBER'] ?? (first.vin ?? '');
+    const first = buildSheet.find(
+      (r) => r.vin || (r as Record<string, string>)["VIN NUMBER"],
+    );
+    if (first)
+      vin = (first as Record<string, string>)["VIN NUMBER"] ?? first.vin ?? "";
   }
 
   let rawHTML: string | undefined;

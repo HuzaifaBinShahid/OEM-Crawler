@@ -1,6 +1,6 @@
 import type { Page } from 'playwright';
-import { selectors } from '../selectors.js';
 import { sleep } from '../utils/sleep.js';
+import { selectors } from '../selectors.js';
 
 const { onCommand: s } = selectors;
 

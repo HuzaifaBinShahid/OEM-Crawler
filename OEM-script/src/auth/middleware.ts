@@ -21,28 +21,50 @@ function getTokenFromRequest(req: Request): string | null {
   return null;
 }
 
-export function requireAuth(req: Request, res: Response, next: NextFunction): void {
+export function requireAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
   const token = getTokenFromRequest(req);
   if (!token) {
-    res.status(401).json({ data: null, message: "Unauthorized", error: "Missing or invalid token" });
+    res.status(401).json({
+      data: null,
+      message: "Unauthorized",
+      error: "Missing or invalid token",
+    });
     return;
   }
   const payload = verifyToken(token) as JwtPayload | null;
   if (!payload || !payload.sub || !payload.email || !payload.role) {
-    res.status(401).json({ data: null, message: "Unauthorized", error: "Invalid token" });
+    res
+      .status(401)
+      .json({ data: null, message: "Unauthorized", error: "Invalid token" });
     return;
   }
   req.user = { id: payload.sub, email: payload.email, role: payload.role };
   next();
 }
 
-export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+export function requireAdmin(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
   if (!req.user) {
-    res.status(401).json({ data: null, message: "Unauthorized", error: "Missing or invalid token" });
+    res.status(401).json({
+      data: null,
+      message: "Unauthorized",
+      error: "Missing or invalid token",
+    });
     return;
   }
   if (req.user.role !== "admin") {
-    res.status(403).json({ data: null, message: "Forbidden", error: "Admin access required" });
+    res.status(403).json({
+      data: null,
+      message: "Forbidden",
+      error: "Admin access required",
+    });
     return;
   }
   next();

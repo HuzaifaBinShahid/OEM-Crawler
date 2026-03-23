@@ -1,7 +1,6 @@
-const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_MODEL = "gpt-4o-mini";
+const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 
-/** All functions accept optional referenceText: include learned query→part examples (and optional category/subcategory path) so the model improves over time. */
 export async function suggestPartFromList(
   apiKey: string,
   query: string,
@@ -27,7 +26,7 @@ export async function suggestPartFromList(
         content: `User is looking for: "${query}"\n\nPart categories:\n${listText}\n\nWhich category (reply with exact name from list)?`,
       },
     ],
-    max_tokens: 150,
+    max_tokens: 200,
     temperature: 0.2,
   };
   const res = await fetch(OPENAI_CHAT_URL, {
@@ -54,7 +53,6 @@ export async function suggestPartFromList(
   return partNames[0] ?? null;
 }
 
-/** Ask AI whether the term is an actual part name (use as-is) or slang/ambiguous (e.g. rotors → brake rotors, starter → starter motor). Returns the exact search phrase to use. */
 export async function suggestSearchTermForPart(
   apiKey: string,
   userTerm: string,
@@ -97,7 +95,6 @@ export async function suggestSearchTermForPart(
   return raw.replace(/\s+/g, " ").trim();
 }
 
-/** From the user's free-text query, extract the single part name to use for the search box. E.g. "i need an alternator" -> "alternator"; "HVAC CONTROL" -> "HVAC CONTROL" (use as-is). */
 export async function extractPartNameForSearch(
   apiKey: string,
   userQuery: string,
@@ -106,8 +103,8 @@ export async function extractPartNameForSearch(
   if (!apiKey.trim() || !userQuery.trim()) return null;
 
   const examples =
-    "Examples: \"i need an alternator\" -> alternator. \"HVAC CONTROL\" -> HVAC CONTROL (use the complete phrase as-is, do not split or change). " +
-    "\"need the accelerator pedal sensor\" -> accelerator pedal sensor. \"left headlight\" -> left headlight. \"muffler\" -> muffler. " +
+    'Examples: "i need an alternator" -> alternator. "HVAC CONTROL" -> HVAC CONTROL (use the complete phrase as-is, do not split or change). ' +
+    '"need the accelerator pedal sensor" -> accelerator pedal sensor. "left headlight" -> left headlight. "muffler" -> muffler. ' +
     "If the user said a slang term (e.g. starter, rad, plugs), return the canonical part name from the terminology. If the term is an official part name (e.g. alternator, fuel pump), return it as-is. " +
     "Reply with ONLY the part name to type in the search box, nothing else.";
 
@@ -151,7 +148,6 @@ export async function extractPartNameForSearch(
   return raw.replace(/\s+/g, " ").trim();
 }
 
-/** Ask OpenAI to extract individual part/search terms from a query that may describe multiple parts (e.g. "i need the muffler and 2 clamps" -> ["muffler", "clamp"]). */
 export async function extractPartTermsFromQuery(
   apiKey: string,
   query: string,
@@ -174,7 +170,7 @@ export async function extractPartTermsFromQuery(
         content: `Query: "${query.trim()}"\n\nList each part/component to search for, one per line:`,
       },
     ],
-    max_tokens: 150,
+    max_tokens: 200,
     temperature: 0.2,
   };
 
@@ -202,7 +198,6 @@ export async function extractPartTermsFromQuery(
   return terms;
 }
 
-/** Ask AI which single category from the list contains the part the user wants. Returns exact category name from list or null. */
 export async function pickCategory(
   apiKey: string,
   userPartTerm: string,
@@ -245,7 +240,7 @@ export async function pickPathFromFullTree(
         content: `User wants this part: "${userPartTerm}"\n\nCatalog sections (pick one subcategory, e.g. Cab > HVAC Control):\n${listText}\n\nWhich section should we open? Reply with the exact path from the list:`,
       },
     ],
-    max_tokens: 150,
+    max_tokens: 200,
     temperature: 0.2,
   };
 
@@ -276,7 +271,6 @@ export async function pickPathFromFullTree(
   return treePaths[0] ?? null;
 }
 
-/** Ask AI which subcategory/subcategories to open for the user's part. Returns one or more exact names from the list (one per line in reply). */
 export async function pickSubcategories(
   apiKey: string,
   userPartTerm: string,
@@ -350,8 +344,12 @@ export async function pickNextSubcategory(
   referenceText?: string,
 ): Promise<string | null> {
   if (!apiKey.trim() || subcategoryNames.length === 0) return null;
-  const excludedSet = new Set(excludedSubcategoryNames.map((n) => n.toLowerCase().replace(/\s+/g, " ")));
-  const remaining = subcategoryNames.filter((n) => !excludedSet.has(n.toLowerCase().replace(/\s+/g, " ")));
+  const excludedSet = new Set(
+    excludedSubcategoryNames.map((n) => n.toLowerCase().replace(/\s+/g, " ")),
+  );
+  const remaining = subcategoryNames.filter(
+    (n) => !excludedSet.has(n.toLowerCase().replace(/\s+/g, " ")),
+  );
   if (remaining.length === 0) return null;
   const listText = remaining.map((p, i) => `${i + 1}. ${p}`).join("\n");
   const triedText =
@@ -375,7 +373,7 @@ export async function pickNextSubcategory(
         content: `Part we need: "${userPartTerm}"\n\nRemaining subcategories to try:\n${listText}\n\nWhich one should we try next? Reply with exact name from the list:`,
       },
     ],
-    max_tokens: 150,
+    max_tokens: 200,
     temperature: 0.2,
   };
 
@@ -389,7 +387,9 @@ export async function pickNextSubcategory(
   });
   if (!res.ok) return null;
 
-  const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  const data = (await res.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
   const raw = data.choices?.[0]?.message?.content?.trim();
   if (!raw) return remaining[0] ?? null;
 
@@ -403,15 +403,12 @@ export async function pickNextSubcategory(
   return remaining[0] ?? null;
 }
 
-/** Table row summary for AI. */
 export interface TableRowOption {
   partNumber: string;
   description: string;
   item?: string;
 }
 
-/** Ask AI which table row (part number) matches the user's part. Returns the part number to pick, or null if none match (use NOT_ON_PAGE to try next table page).
- *  Match by meaning: e.g. "water pump" matches "Kit, Water Pump", "Water Pump Assembly", etc. Only NOT_ON_PAGE when no row is about the requested part at all. */
 export async function pickTableRow(
   apiKey: string,
   userPartTerm: string,
@@ -475,7 +472,6 @@ export async function pickTableRow(
   );
   if (match) return match.partNumber;
 
-  // Fallback: if AI said NOT_ON_PAGE but a row clearly describes the part (e.g. "Kit, Water Pump" for "water pump"), pick it
   const termLower = userPartTerm.toLowerCase().replace(/\s+/g, " ").trim();
   const termNorm = termLower.replace(/,/g, " ");
   const byDescription = tableRows.filter((r) => {
@@ -494,10 +490,6 @@ export async function pickTableRow(
   return null;
 }
 
-/**
- * From search results (parts table), pick the ONE part most likely correct for the user's query
- * using reference data (learned + builtin query→part examples). Used to show "Suggested by AI" on the frontend.
- */
 export async function pickSuggestedPartFromSearchResults(
   apiKey: string,
   userQuery: string,

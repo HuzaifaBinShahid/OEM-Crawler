@@ -1,5 +1,5 @@
-import jwt, { type SignOptions } from "jsonwebtoken";
 import { loadConfig } from "../config.js";
+import jwt, { type SignOptions } from "jsonwebtoken";
 
 export type JwtPayload = {
   sub: number;

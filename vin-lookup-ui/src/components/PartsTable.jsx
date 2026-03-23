@@ -25,7 +25,11 @@ function PartsTable({ columns, data, selectColumn, suggestedPart }) {
 
   const renderCell = (row, col) => {
     const value = getCellValue(row, col);
-    if (col.key === 'figureImageUrl' && value && typeof value === 'string' && value.startsWith('http')) {
+    const isFigureSrc =
+      value &&
+      typeof value === 'string' &&
+      (value.startsWith('http') || value.startsWith('data:image'));
+    if (col.key === 'figureImageUrl' && isFigureSrc) {
       return (
         <button
           type="button"

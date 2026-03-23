@@ -1,14 +1,11 @@
-/**
- * Calls Navistar ChassisType API to resolve the exact Detail List parent (and subcategory)
- * from the search response's figVartnId, so we only open that category.
- */
-
 import { loadConfig } from "../config.js";
 
-/** Optional: use this when calling from a browser context so requests use the same session/cookies. */
-export type ChassisTypeFetcher = (url: string) => Promise<{ ok: boolean; json(): Promise<unknown> }>;
+export type ChassisTypeFetcher = (
+  url: string,
+) => Promise<{ ok: boolean; json(): Promise<unknown> }>;
 
-const normalizePartNumber = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();
+const normalizePartNumber = (s: string) =>
+  s.replace(/\s+/g, " ").trim().toLowerCase();
 
 export interface ChassisTypePart {
   partNumber?: string;
@@ -43,15 +40,10 @@ function buildTreeUrl(vin: string): string {
   return `${base}/npc/myportal/ChassisType?chassis_no=${encodeURIComponent(vin)}&chass_id=&vin=${encodeURIComponent(vin)}&_=${Date.now()}`;
 }
 
-/**
- * GET ChassisType?chassis_no=vin&nounDesc=... (search by part name/description).
- * Returns array of parts; each may have figVartnId, partNumber, etc.
- * When fetchLike is provided (e.g. from Playwright page.request), uses that so the request runs with the page's cookies.
- */
 export async function fetchChassisTypeSearch(
   vin: string,
   nounDesc: string,
-  fetchLike?: ChassisTypeFetcher
+  fetchLike?: ChassisTypeFetcher,
 ): Promise<ChassisTypePart[]> {
   const url = buildSearchUrl(vin, nounDesc);
   const res = fetchLike
@@ -59,16 +51,12 @@ export async function fetchChassisTypeSearch(
     : await fetch(url, { method: "GET", signal: AbortSignal.timeout(15000) });
   if (!res.ok) return [];
   const json = await res.json();
-  return Array.isArray(json) ? json as ChassisTypePart[] : [];
+  return Array.isArray(json) ? (json as ChassisTypePart[]) : [];
 }
 
-/**
- * GET ChassisType?chassis_no=vin&chass_id=&vin=vin (tree without nounDesc).
- * Returns tree with nodes[].text, partsUrl, figureUrl, nodes[].
- */
 export async function fetchChassisTypeTree(
   vin: string,
-  fetchLike?: ChassisTypeFetcher
+  fetchLike?: ChassisTypeFetcher,
 ): Promise<ChassisTypeTreeResponse> {
   const url = buildTreeUrl(vin);
   const res = fetchLike
@@ -76,7 +64,9 @@ export async function fetchChassisTypeTree(
     : await fetch(url, { method: "GET", signal: AbortSignal.timeout(15000) });
   if (!res.ok) return {};
   const json = await res.json();
-  return (json && typeof json === "object") ? json as ChassisTypeTreeResponse : {};
+  return json && typeof json === "object"
+    ? (json as ChassisTypeTreeResponse)
+    : {};
 }
 
 function urlContainsVartnId(url: string | undefined, vartnId: number): boolean {
@@ -90,22 +80,20 @@ function urlContainsVartnId(url: string | undefined, vartnId: number): boolean {
   );
 }
 
-/**
- * Recursively find a tree node whose partsUrl or figureUrl contains the given vartnId.
- * Returns { parentName, subcategoryName } where parentName is the root category (e.g. "Engines")
- * and subcategoryName is the matching node's text (e.g. "ACCEL PEDAL ASM") if it's not a root.
- */
 function findNodeByVartnId(
   nodes: ChassisTypeTreeNode[] | undefined,
   vartnId: number,
-  rootName?: string
+  rootName?: string,
 ): { parentName: string; subcategoryName?: string } | null {
   if (!nodes || !Array.isArray(nodes)) return null;
   for (const node of nodes) {
     const text = (node.text || "").trim();
     const partsUrl = node.partsUrl || "";
     const figureUrl = node.figureUrl || "";
-    if (urlContainsVartnId(partsUrl, vartnId) || urlContainsVartnId(figureUrl, vartnId)) {
+    if (
+      urlContainsVartnId(partsUrl, vartnId) ||
+      urlContainsVartnId(figureUrl, vartnId)
+    ) {
       const parentName = rootName ?? text;
       const subcategoryName = rootName ? text : undefined;
       return { parentName, subcategoryName };
@@ -124,16 +112,10 @@ export interface ResolvedDetailListParent {
   subcategoryName?: string;
 }
 
-/**
- * Resolve the exact Detail List parent (and optional subcategory) for the selected part
- * by calling the ChassisType search API, finding the matching part's figVartnId,
- * then finding the tree node that contains that vartn_id.
- * Pass fetchLike (e.g. page.request.get from Playwright) so requests use the browser session.
- */
 export async function resolveDetailListParent(
   vin: string,
   selectedPart: { partNumber: string; description?: string },
-  options?: { fetchLike?: ChassisTypeFetcher }
+  options?: { fetchLike?: ChassisTypeFetcher },
 ): Promise<ResolvedDetailListParent | null> {
   const partNum = (selectedPart.partNumber || "").trim();
   const nounDesc = partNum || (selectedPart.description || "").trim();
@@ -152,7 +134,12 @@ export async function resolveDetailListParent(
   const targetNorm = normalizePartNumber(partNum);
   const match = parts.find((p) => {
     const pn = (p.partNumber || "").trim();
-    return pn && (normalizePartNumber(pn) === targetNorm || normalizePartNumber(pn).includes(targetNorm) || targetNorm.includes(normalizePartNumber(pn)));
+    return (
+      pn &&
+      (normalizePartNumber(pn) === targetNorm ||
+        normalizePartNumber(pn).includes(targetNorm) ||
+        targetNorm.includes(normalizePartNumber(pn)))
+    );
   });
   if (!match) return null;
 
@@ -168,7 +155,6 @@ export async function resolveDetailListParent(
 
   const topNodes = tree.nodes;
   if (!topNodes || !Array.isArray(topNodes)) return null;
-  // Top level is usually [ { text: chassisNumber, nodes: [ root categories ] } ]
   let categories: ChassisTypeTreeNode[] | undefined;
   for (const n of topNodes) {
     if (n.nodes && n.nodes.length > 0) {

@@ -1,5 +1,5 @@
-import type { VinLookupResult } from "../runner.js";
 import { getPool } from "./connection.js";
+import type { VinLookupResult } from "../runner.js";
 
 export interface VinLookupQuery {
   vin: string;
@@ -13,7 +13,10 @@ const skuNorm = (v: string | undefined) => {
   const raw = (v ?? "").trim();
   if (!raw) return "";
   let text = raw.toLowerCase();
-  text = text.replace(/^(i\s+need\s+|i\s+want\s+|need\s+|please\s+find\s+|please\s+)/, "");
+  text = text.replace(
+    /^(i\s+need\s+|i\s+want\s+|need\s+|please\s+find\s+|please\s+)/,
+    "",
+  );
   text = text.replace(/[^a-z0-9]+/g, " ");
   text = text.trim().replace(/\s+/g, " ");
   return text;
@@ -81,4 +84,33 @@ export async function getLookupsByUserId(
     [userId, limit],
   );
   return { total, lookups: listRes.rows };
+}
+
+/**
+ * Load recent successful lookups from internal/admin users for AI learning.
+ * Returns the raw query + full JSONB result so the AI can learn from
+ * everything stored in the database, not just code-defined examples.
+ */
+export interface DbLearnedLookup {
+  query_sku_query: string;
+  query_vin: string;
+  result: VinLookupResult;
+}
+
+export async function getInternalUserLookups(
+  limit = 200,
+): Promise<DbLearnedLookup[]> {
+  const pool = getPool();
+  const res = await pool.query<DbLearnedLookup>(
+    `SELECT vl.query_sku_query, vl.query_vin, vl.result
+     FROM vin_lookups vl
+     JOIN users u ON u.id = vl.user_id
+     WHERE u.role IN ('admin', 'internal')
+       AND vl.query_sku_query <> ''
+       AND vl.result IS NOT NULL
+     ORDER BY vl.created_at DESC
+     LIMIT $1`,
+    [limit],
+  );
+  return res.rows;
 }

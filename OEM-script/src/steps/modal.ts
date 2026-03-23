@@ -7,7 +7,10 @@ const ONCOMMAND_MODAL_WAIT_MS = 4000;
 export async function closePostLoginModal(page: Page): Promise<void> {
   const closeBtn = page.locator(selectors.modal.closeButton).first();
   try {
-    await closeBtn.waitFor({ state: "visible", timeout: POST_LOGIN_MODAL_WAIT_MS });
+    await closeBtn.waitFor({
+      state: "visible",
+      timeout: POST_LOGIN_MODAL_WAIT_MS,
+    });
     await closeBtn.click();
     await page
       .waitForSelector(selectors.modal.closeButton, {
@@ -15,8 +18,7 @@ export async function closePostLoginModal(page: Page): Promise<void> {
         timeout: 2000,
       })
       .catch(() => {});
-  } catch {
-  }
+  } catch {}
 }
 
 export async function closeOnCommandMessageModal(page: Page): Promise<void> {

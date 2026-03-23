@@ -35,10 +35,7 @@ function loadTerminology(): Record<string, PartTermEntry> {
 }
 
 function normalizeKey(s: string): string {
-  return s
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
+  return s.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
 export function resolvePartTerm(term: string): string {

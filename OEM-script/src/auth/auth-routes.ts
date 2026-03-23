@@ -1,6 +1,7 @@
 import type { Request, Response } from "express";
-import { hashPassword, verifyPassword } from "./hash.js";
+
 import { signToken } from "./jwt.js";
+import { hashPassword, verifyPassword } from "./hash.js";
 import { findUserByEmail, createUser, type UserSafe } from "./user-repo.js";
 
 const MIN_PASSWORD_LENGTH = 8;
@@ -11,13 +12,21 @@ function apiResponse(
   status: number,
   data: unknown,
   message: string,
-  error: string | null = null
+  error: string | null = null,
 ): void {
   res.status(status).json({ data, message, error });
 }
 
-function toSafeUser(user: { id: number; email: string; role: string }): UserSafe {
-  return { id: user.id, email: user.email, role: user.role as UserSafe["role"] };
+function toSafeUser(user: {
+  id: number;
+  email: string;
+  role: string;
+}): UserSafe {
+  return {
+    id: user.id,
+    email: user.email,
+    role: user.role as UserSafe["role"],
+  };
 }
 
 export async function handleSignup(req: Request, res: Response): Promise<void> {
@@ -34,7 +43,13 @@ export async function handleSignup(req: Request, res: Response): Promise<void> {
     return;
   }
   if (password.length < MIN_PASSWORD_LENGTH) {
-    apiResponse(res, 400, null, "Bad request", `Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+    apiResponse(
+      res,
+      400,
+      null,
+      "Bad request",
+      `Password must be at least ${MIN_PASSWORD_LENGTH} characters`,
+    );
     return;
   }
 
@@ -66,7 +81,13 @@ export async function handleLogin(req: Request, res: Response): Promise<void> {
   const password = typeof body?.password === "string" ? body.password : "";
 
   if (!email || !password) {
-    apiResponse(res, 400, null, "Bad request", "Email and password are required");
+    apiResponse(
+      res,
+      400,
+      null,
+      "Bad request",
+      "Email and password are required",
+    );
     return;
   }
 
@@ -96,5 +117,11 @@ export function handleMe(req: Request, res: Response): void {
     apiResponse(res, 401, null, "Unauthorized", "Not authenticated");
     return;
   }
-  apiResponse(res, 200, { id: req.user.id, email: req.user.email, role: req.user.role }, "Success", null);
+  apiResponse(
+    res,
+    200,
+    { id: req.user.id, email: req.user.email, role: req.user.role },
+    "Success",
+    null,
+  );
 }

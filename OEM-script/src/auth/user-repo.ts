@@ -22,7 +22,7 @@ export async function findUserByEmail(email: string): Promise<User | null> {
   const pool = getPool();
   const result = await pool.query<User>(
     "SELECT id, email, password_hash, role, created_at, updated_at FROM users WHERE email = $1",
-    [normalized]
+    [normalized],
   );
   return result.rows[0] ?? null;
 }
@@ -31,7 +31,7 @@ export async function findUserById(id: number): Promise<User | null> {
   const pool = getPool();
   const result = await pool.query<User>(
     "SELECT id, email, password_hash, role, created_at, updated_at FROM users WHERE id = $1",
-    [id]
+    [id],
   );
   return result.rows[0] ?? null;
 }
@@ -39,7 +39,7 @@ export async function findUserById(id: number): Promise<User | null> {
 export async function findAllUsers(): Promise<UserSafe[]> {
   const pool = getPool();
   const result = await pool.query<User>(
-    "SELECT id, email, password_hash, role, created_at, updated_at FROM users ORDER BY created_at DESC"
+    "SELECT id, email, password_hash, role, created_at, updated_at FROM users ORDER BY created_at DESC",
   );
   return result.rows.map((row) => ({
     id: row.id,
@@ -57,7 +57,7 @@ export async function createUser(params: {
   const pool = getPool();
   const result = await pool.query<User>(
     "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, password_hash, role, created_at, updated_at",
-    [normalized, params.passwordHash, params.role]
+    [normalized, params.passwordHash, params.role],
   );
   return result.rows[0]!;
 }
@@ -93,7 +93,7 @@ export async function updateUser(params: {
   values.push(id);
   const result = await pool.query<User>(
     `UPDATE users SET ${fields.join(", ")}, updated_at = NOW() WHERE id = $${idx} RETURNING id, email, password_hash, role, created_at, updated_at`,
-    values
+    values,
   );
   if (result.rows.length === 0) {
     throw new Error("User not found");
@@ -114,6 +114,6 @@ export async function ensureAdminUser(params: {
   const pool = getPool();
   await pool.query(
     "INSERT INTO users (email, password_hash, role) VALUES ($1, $2, 'admin') ON CONFLICT (email) DO NOTHING",
-    [normalized, params.passwordHash]
+    [normalized, params.passwordHash],
   );
 }

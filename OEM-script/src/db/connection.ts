@@ -1,6 +1,7 @@
-import { loadConfig } from "../config.js";
-import type { Pool } from "pg";
 import pg from "pg";
+import type { Pool } from "pg";
+
+import { loadConfig } from "../config.js";
 
 const { Pool: PgPool } = pg;
 let pool: Pool | null = null;

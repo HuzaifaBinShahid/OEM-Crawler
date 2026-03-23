@@ -1,8 +1,9 @@
-import type { Page } from 'playwright';
-import { getReferenceTextForPromptAsync, appendLearnedExample } from '../data/query-examples.js';
-import type { Config } from '../config.js';
-import { loadConfig } from '../config.js';
-import { selectors } from '../selectors.js';
+import { Buffer } from "node:buffer";
+import type { Page } from "playwright";
+import {
+  getReferenceTextForPromptAsync,
+  appendLearnedExample,
+} from "../data/query-examples.js";
 import {
   extractPartTermsFromQuery,
   pickCategory,
@@ -10,9 +11,11 @@ import {
   pickSubcategories,
   pickTableRow,
   type TableRowOption,
-} from '../services/ai-fallback.js';
-import { sleep } from '../utils/sleep.js';
-import { ScraperCancelledError } from '../scraper-cancelled-error.js';
+} from "../services/ai-fallback.js";
+import { sleep } from "../utils/sleep.js";
+import { loadConfig } from "../config.js";
+import { selectors } from "../selectors.js";
+import { ScraperCancelledError } from "../scraper-cancelled-error.js";
 
 const { onCommand: oc } = selectors;
 const TREE_WAIT_MS = 6000;
@@ -25,27 +28,50 @@ const DETAIL_LIST_TREE_WAIT_MS = 60000;
 const DETAIL_LIST_RETRY_SLEEP_MS = 2000;
 const DETAIL_LIST_MAX_TREE_RETRIES = 5;
 const DETAIL_LIST_MAX_TABLE_RETRIES = 2;
-/** When API does not return a category, AI suggests parent categories; we try at most this many parents (and their subcategories). */
 const DETAIL_LIST_MAX_AI_PARENTS = 3;
 const TABLE_STABILITY_MS = 400;
 const OPTIONS_COL = 6;
 
 async function waitForPartsTableReady(page: Page): Promise<void> {
   await Promise.race([
-    page.locator(oc.partsTable).locator('tbody tr').first().waitFor({ state: 'visible', timeout: TABLE_READY_TIMEOUT_MS }).catch(() => {}),
-    page.locator(oc.partsTable).locator('td.dataTables_empty').waitFor({ state: 'visible', timeout: TABLE_READY_TIMEOUT_MS }).catch(() => {}),
-    page.locator(oc.partsTablePaginate).waitFor({ state: 'visible', timeout: TABLE_READY_TIMEOUT_MS }).catch(() => {}),
+    page
+      .locator(oc.partsTable)
+      .locator("tbody tr")
+      .first()
+      .waitFor({ state: "visible", timeout: TABLE_READY_TIMEOUT_MS })
+      .catch(() => {}),
+    page
+      .locator(oc.partsTable)
+      .locator("td.dataTables_empty")
+      .waitFor({ state: "visible", timeout: TABLE_READY_TIMEOUT_MS })
+      .catch(() => {}),
+    page
+      .locator(oc.partsTablePaginate)
+      .waitFor({ state: "visible", timeout: TABLE_READY_TIMEOUT_MS })
+      .catch(() => {}),
   ]);
   await sleep(TABLE_STABILITY_MS);
 }
 
 async function waitForDetailListTableAndFilter(page: Page): Promise<void> {
-  const filterInput = page.locator('#partsTable_filter input').first();
-  await filterInput.waitFor({ state: 'visible', timeout: DETAIL_LIST_TABLE_WAIT_MS });
+  const filterInput = page.locator("#partsTable_filter input").first();
+  await filterInput.waitFor({
+    state: "visible",
+    timeout: DETAIL_LIST_TABLE_WAIT_MS,
+  });
   await sleep(300);
   await Promise.race([
-    page.locator(oc.partsTable).locator('tbody tr').first().waitFor({ state: 'visible', timeout: DETAIL_LIST_TBODY_WAIT_MS }).catch(() => {}),
-    page.locator(oc.partsTable).locator('td.dataTables_empty').waitFor({ state: 'visible', timeout: DETAIL_LIST_TBODY_WAIT_MS }).catch(() => {}),
+    page
+      .locator(oc.partsTable)
+      .locator("tbody tr")
+      .first()
+      .waitFor({ state: "visible", timeout: DETAIL_LIST_TBODY_WAIT_MS })
+      .catch(() => {}),
+    page
+      .locator(oc.partsTable)
+      .locator("td.dataTables_empty")
+      .waitFor({ state: "visible", timeout: DETAIL_LIST_TBODY_WAIT_MS })
+      .catch(() => {}),
   ]);
   await sleep(TABLE_STABILITY_MS);
 }
@@ -57,123 +83,162 @@ export interface PartRow {
   servicePartNumber?: string;
   requiredQuantity?: string;
   rowIndex?: number;
-  /** Path from openSec2 second arg (ChassisArts), e.g. /npc/myportal/ChassisArts?vartn_id=... */
   figurePagePath?: string;
-  /** Resolved figure image URL after fetching from figure page */
   figureImageUrl?: string;
 }
 
-/** Parse openSec2('partNo','/path/to/ChassisArts?...') second argument for figure page path. */
 function parseOpenSec2FigurePath(onclick: string | null): string | undefined {
-  if (!onclick || typeof onclick !== 'string') return undefined;
+  if (!onclick || typeof onclick !== "string") return undefined;
   const m = /openSec2\s*\(\s*'[^']*'\s*,\s*'([^']*)'/.exec(onclick);
   if (!m) return undefined;
-  return m[1]!.replace(/&amp;/g, '&').trim() || undefined;
+  return m[1]!.replace(/&amp;/g, "&").trim() || undefined;
 }
 
-const FIGURE_PAGE_TIMEOUT_MS = 15_000;
-const FIGURE_IMAGE_WAIT_MS = 6_000;
+const FIGURE_IMAGE_MAX_BYTES = 4 * 1024 * 1024;
 
-/** Build full image URL from ChassisArts JSON figrFileNme (e.g. "/../pco/images/12MDT007801.gif"). */
-function figureFileNameToUrl(figrFileNme: string, base: string): string {
-  const normalized = figrFileNme.replace(/^\/+\.\.\//, '/').replace(/^\/+/, '/');
-  return `${base.replace(/\/$/, '')}${normalized}`;
+function candidateFigureImageUrls(
+  figrFileNme: string,
+  pageUrl: string,
+  imageBase: string,
+): string[] {
+  const raw = figrFileNme.replace(/&amp;/g, "").trim();
+  if (!raw) return [];
+  const nav = imageBase.replace(/\/$/, "");
+  let origin = "";
+  try {
+    origin = new URL(pageUrl).origin;
+  } catch {
+    /* empty */
+  }
+  const candidates: string[] = [];
+  const add = (u: string) => {
+    if (u && !candidates.includes(u)) candidates.push(u);
+  };
+  // Strip leading /../ → path from site root (common API shape)
+  const fromRoot = raw.replace(/^\/+\.\.\//, "/").replace(/^\/+/, "/");
+  add(`${nav}${fromRoot.startsWith("/") ? fromRoot : `/${fromRoot}`}`);
+  if (origin) {
+    add(`${origin}${fromRoot.startsWith("/") ? fromRoot : `/${fromRoot}`}`);
+    try {
+      const chassis = new URL("/npc/myportal/ChassisArts", `${origin}/`);
+      const resolved = new URL(raw.replace(/^\//, ""), chassis).href;
+      add(resolved);
+    } catch {
+      /* empty */
+    }
+    try {
+      const resolved2 = new URL(raw, `${origin}/npc/myportal/`).href;
+      add(resolved2);
+    } catch {
+      /* empty */
+    }
+  }
+  return candidates;
 }
 
-/** Open figure page in same tab. If ChassisArts returns JSON with figrFileNme, use that; else wait for #mapster_wrap_0 img. Then navigate back to saved URL. */
-async function fetchFigureImageUrlFromPath(
+async function figureImageFileNameFromChassisArts(
   page: Page,
   figurePath: string,
-  config: Config,
+  imageBase: string,
 ): Promise<string | undefined> {
-  const path = figurePath.startsWith('/') ? figurePath : `/${figurePath}`;
-  const currentUrl = page.url();
-  let origin: string;
+  const path = figurePath.startsWith("/") ? figurePath : `/${figurePath}`;
+  const bases: string[] = [];
   try {
-    origin = new URL(currentUrl).origin;
+    bases.push(new URL(page.url()).origin);
   } catch {
-    origin = config.navistarPortalBaseUrl.replace(/\/$/, '');
+    /* empty */
   }
-  const figureUrl = `${origin}${path}`;
-  const base = config.navistarPortalBaseUrl.replace(/\/$/, '');
-
-  try {
-    await page.goto(figureUrl, { waitUntil: 'domcontentloaded', timeout: FIGURE_PAGE_TIMEOUT_MS });
-    await sleep(500);
-
-    const bodyText = await page.evaluate(() => document.body?.innerText?.trim() ?? '').catch(() => '');
-    const jsonMatch = bodyText.match(/^\s*\[/);
-    if (jsonMatch) {
-      try {
-        const data = JSON.parse(bodyText) as Array<{ figrFileNme?: string }>;
-        const first = Array.isArray(data) && data.length > 0 ? data[0] : null;
-        const figrFileNme = first?.figrFileNme;
-        if (figrFileNme && typeof figrFileNme === 'string') {
-          const imageUrl = figureFileNameToUrl(figrFileNme, base);
-          return imageUrl;
-        }
-      } catch {
-        /* not valid JSON, fall through to DOM scrape */
-      }
+  bases.push(imageBase);
+  const tried = new Set<string>();
+  for (const b of bases) {
+    const base = b.replace(/\/$/, "");
+    if (tried.has(base)) continue;
+    tried.add(base);
+    const url = `${base}${path}`;
+    try {
+      const res = await page.context().request.get(url, {
+        timeout: 20_000,
+        headers: { Accept: "application/json, text/plain, */*" },
+      });
+      const text = (await res.text()).trim();
+      if (!text.startsWith("[")) continue;
+      const data = JSON.parse(text) as Array<{ figrFileNme?: string }>;
+      const figrFileNme = Array.isArray(data) && data[0]?.figrFileNme;
+      if (typeof figrFileNme === "string" && figrFileNme.trim())
+        return figrFileNme.trim();
+    } catch {
+      continue;
     }
-
-    await page.waitForSelector('#mapster_wrap_0 img, [id^="mapster_wrap"] img', {
-      state: 'visible',
-      timeout: FIGURE_IMAGE_WAIT_MS,
-    }).catch(() => null);
-    await sleep(600);
-
-    const imgSrc = await page
-      .evaluate(() => {
-        const wrap = document.querySelector('#mapster_wrap_0, [id^="mapster_wrap"]');
-        const img = wrap?.querySelector('img.mapster_el, img.img-responsive, img') as HTMLImageElement | null;
-        const src = img?.src?.trim();
-        if (!src || src === '' || src === window.location.href) return null;
-        return src;
-      })
-      .catch(() => null);
-
-    if (imgSrc && imgSrc.startsWith('http')) return imgSrc;
-    if (imgSrc && imgSrc.startsWith('/')) return `${base}${imgSrc}`;
-    return imgSrc || undefined;
-  } catch {
-    return undefined;
-  } finally {
-    await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: FIGURE_PAGE_TIMEOUT_MS }).catch(() => {});
   }
+  return undefined;
 }
 
-/** For each part with figurePagePath, open figure page and set figureImageUrl. Dedupes by path. */
-export async function enrichPartsWithFigureImages(
+async function fetchFigureAsDataUrl(
+  page: Page,
+  pageUrl: string,
+  imageBase: string,
+  figrFileNme: string,
+): Promise<string | undefined> {
+  const candidates = candidateFigureImageUrls(figrFileNme, pageUrl, imageBase);
+  for (const imageUrl of candidates) {
+    try {
+      const res = await page.context().request.get(imageUrl, {
+        timeout: 25_000,
+        headers: { Accept: "image/*,*/*" },
+      });
+      if (!res.ok()) continue;
+      const headers = res.headers();
+      const ct = (headers["content-type"] || headers["Content-Type"] || "")
+        .split(";")[0]!
+        .trim()
+        .toLowerCase();
+      if (!ct.startsWith("image/")) continue;
+      const buf = Buffer.from(await res.body());
+      if (buf.length === 0 || buf.length > FIGURE_IMAGE_MAX_BYTES) continue;
+      const b64 = buf.toString("base64");
+      return `data:${ct};base64,${b64}`;
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+}
+
+async function enrichPartsFigureImages(
   page: Page,
   parts: PartRow[],
-  config: Config,
-  onStatus?: (message: string) => void,
 ): Promise<void> {
-  const paths = [...new Set(parts.map((p) => p.figurePagePath).filter(Boolean))] as string[];
-  if (paths.length === 0) return;
-  const status = (msg: string) => {
-    console.log('[part-search]', msg);
-    onStatus?.(msg);
-  };
-  const pathToUrl = new Map<string, string>();
+  const imageBase = loadConfig().navistarPortalBaseUrl.replace(/\/$/, "");
+  const pageUrl = page.url();
+  const paths = [
+    ...new Set(parts.map((p) => p.figurePagePath).filter(Boolean)),
+  ] as string[];
+  const pathToDisplayUrl = new Map<string, string>();
   for (const path of paths) {
-    status('Fetching figure image...');
-    const imageUrl = await fetchFigureImageUrlFromPath(page, path, config);
-    if (imageUrl) pathToUrl.set(path, imageUrl);
+    const figrFileNme = await figureImageFileNameFromChassisArts(
+      page,
+      path,
+      imageBase,
+    );
+    if (!figrFileNme) continue;
+    const dataUrl = await fetchFigureAsDataUrl(
+      page,
+      pageUrl,
+      imageBase,
+      figrFileNme,
+    );
+    if (dataUrl) pathToDisplayUrl.set(path, dataUrl);
   }
   for (const p of parts) {
-    if (p.figurePagePath && pathToUrl.has(p.figurePagePath)) {
-      p.figureImageUrl = pathToUrl.get(p.figurePagePath);
-    }
+    const u = p.figurePagePath
+      ? pathToDisplayUrl.get(p.figurePagePath)
+      : undefined;
+    if (u) p.figureImageUrl = u;
   }
 }
 
 function normalize(s: string): string {
-  return s
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .trim();
+  return s.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
 function nodeTextMatches(nodeText: string, aiName: string): boolean {
@@ -183,26 +248,44 @@ function nodeTextMatches(nodeText: string, aiName: string): boolean {
   return n === a || n.includes(a) || a.includes(n);
 }
 
-type NodeInfo = { index: number; text: string; nodeId: string; hasExpandPlus: boolean; indentCount: number };
+type NodeInfo = {
+  index: number;
+  text: string;
+  nodeId: string;
+  hasExpandPlus: boolean;
+  indentCount: number;
+};
 
-async function getTreeNodes(page: Page, treeWaitMs: number = TREE_WAIT_MS): Promise<NodeInfo[]> {
-  await page.waitForSelector(oc.illustrationsList, { state: 'visible', timeout: treeWaitMs });
-  await page.waitForSelector(oc.treeNode, { state: 'visible', timeout: treeWaitMs });
+async function getTreeNodes(
+  page: Page,
+  treeWaitMs: number = TREE_WAIT_MS,
+): Promise<NodeInfo[]> {
+  await page.waitForSelector(oc.illustrationsList, {
+    state: "visible",
+    timeout: treeWaitMs,
+  });
+  await page.waitForSelector(oc.treeNode, {
+    state: "visible",
+    timeout: treeWaitMs,
+  });
   await sleep(300);
   const nodes = await page.locator(oc.treeNode).all();
   const infos: NodeInfo[] = [];
   for (let i = 0; i < nodes.length; i++) {
     const li = nodes[i]!;
-    const text = (await li.innerText()).replace(/^[\s±−+]+/, '').trim();
-    const nodeId = (await li.getAttribute('data-nodeid')) ?? '';
-    const hasExpandPlus = await li.locator(oc.treeExpandIcon).first().isVisible().catch(() => false);
-    const indentCount = await li.locator('span.indent').count();
+    const text = (await li.innerText()).replace(/^[\s±−+]+/, "").trim();
+    const nodeId = (await li.getAttribute("data-nodeid")) ?? "";
+    const hasExpandPlus = await li
+      .locator(oc.treeExpandIcon)
+      .first()
+      .isVisible()
+      .catch(() => false);
+    const indentCount = await li.locator("span.indent").count();
     infos.push({ index: i, text, nodeId, hasExpandPlus, indentCount });
   }
   return infos;
 }
 
-/** Get part categories for AI: skip the first node (VIN/chassis row), then all nodes at the same indent as the second node (Frame, Engines, Cab, etc.). */
 function getRootCategories(infos: NodeInfo[]): NodeInfo[] {
   if (infos.length <= 1) return [];
   const rest = infos.slice(1);
@@ -210,8 +293,11 @@ function getRootCategories(infos: NodeInfo[]): NodeInfo[] {
   return rest.filter((i) => i.indentCount === categoryIndent);
 }
 
-/** Get direct children of the node at matchIndex (next level only). */
-function getDirectChildren(infos: NodeInfo[], matchIndex: number, matchIndent: number): NodeInfo[] {
+function getDirectChildren(
+  infos: NodeInfo[],
+  matchIndex: number,
+  matchIndent: number,
+): NodeInfo[] {
   const children: NodeInfo[] = [];
   for (let i = matchIndex + 1; i < infos.length; i++) {
     const info = infos[i]!;
@@ -221,99 +307,115 @@ function getDirectChildren(infos: NodeInfo[], matchIndex: number, matchIndent: n
   return children;
 }
 
-/** Scrape all visible table rows (no text filter). Returns rows with DOM rowIndex, and indices of rows that have Related Parts link.
- *  Uses a single evaluate() for speed when possible. */
-async function scrapeAllTableRows(page: Page): Promise<{ parts: PartRow[]; relatedLinkRowIndices: number[] }> {
+async function scrapeAllTableRows(
+  page: Page,
+): Promise<{ parts: PartRow[]; relatedLinkRowIndices: number[] }> {
   const OPTIONS_COL_1 = OPTIONS_COL;
 
   const result = await page
-    .evaluate(
-      (optionsCol) => {
-        const rows = document.querySelectorAll('#partsTable tbody tr');
-        const parts: Array<{
-          item?: string;
-          partNumber: string;
-          description: string;
-          servicePartNumber?: string;
-          requiredQuantity?: string;
-          rowIndex: number;
-          figurePagePath?: string;
-        }> = [];
-        const relatedLinkRowIndices: number[] = [];
-        const openSec2Re = /openSec2\s*\(\s*'[^']*'\s*,\s*'([^']*)'/;
-        for (let i = 0; i < rows.length; i++) {
-          const row = rows[i] as HTMLTableRowElement;
-          if (row.classList.contains('group')) continue;
-          const empty = row.querySelector('td.dataTables_empty');
-          if (empty) continue;
-          const tds = row.querySelectorAll('td');
-          if (tds.length < 4) continue;
-          const rowText = row.innerText || '';
-          if (/no matching records found/i.test(rowText)) continue;
-          const partNumCell = tds[2];
-          const link = partNumCell?.querySelector('a');
-          let partNumber = (link?.textContent || (tds[2]?.textContent || '')).trim();
-          const description = (tds[3]?.textContent || '').trim();
-          const item = (tds[1]?.textContent || '').trim();
-          const servicePartNumber = (tds[4]?.textContent || '').trim() || undefined;
-          const requiredQuantity = tds.length > 6 ? (tds[6]?.textContent || '').trim() : undefined;
-          let figurePagePath = undefined;
-          const lastCell = tds[tds.length - 1];
-          const figLink = lastCell?.querySelector('a[onclick*="openSec2"]');
-          const onclick = (figLink || link)?.getAttribute('onclick');
-          if (onclick && openSec2Re.test(onclick)) {
-            const m = openSec2Re.exec(onclick);
-            if (m) figurePagePath = m[1].replace(/&amp;/g, '&').trim() || undefined;
-          }
-          if (!partNumber && !description) continue;
-          const hasRelated = row.querySelector(`td:nth-child(${optionsCol}) img.relatedURL`) != null;
-          parts.push({
-            item: item || undefined,
-            partNumber,
-            description,
-            servicePartNumber: servicePartNumber || undefined,
-            requiredQuantity: requiredQuantity || undefined,
-            rowIndex: i,
-            figurePagePath,
-          });
-          if (hasRelated) relatedLinkRowIndices.push(i);
+    .evaluate((optionsCol) => {
+      const rows = document.querySelectorAll("#partsTable tbody tr");
+      const parts: Array<{
+        item?: string;
+        partNumber: string;
+        description: string;
+        servicePartNumber?: string;
+        requiredQuantity?: string;
+        rowIndex: number;
+        figurePagePath?: string;
+      }> = [];
+      const relatedLinkRowIndices: number[] = [];
+      const openSec2Re = /openSec2\s*\(\s*'[^']*'\s*,\s*'([^']*)'/;
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i] as HTMLTableRowElement;
+        if (row.classList.contains("group")) continue;
+        const empty = row.querySelector("td.dataTables_empty");
+        if (empty) continue;
+        const tds = row.querySelectorAll("td");
+        if (tds.length < 4) continue;
+        const rowText = row.innerText || "";
+        if (/no matching records found/i.test(rowText)) continue;
+        const partNumCell = tds[2];
+        const link = partNumCell?.querySelector("a");
+        let partNumber = (
+          link?.textContent ||
+          tds[2]?.textContent ||
+          ""
+        ).trim();
+        const description = (tds[3]?.textContent || "").trim();
+        const item = (tds[1]?.textContent || "").trim();
+        const servicePartNumber =
+          (tds[4]?.textContent || "").trim() || undefined;
+        const requiredQuantity =
+          tds.length > 6 ? (tds[6]?.textContent || "").trim() : undefined;
+        let figurePagePath = undefined;
+        const lastCell = tds[tds.length - 1];
+        const figLink = lastCell?.querySelector('a[onclick*="openSec2"]');
+        const onclick = (figLink || link)?.getAttribute("onclick");
+        if (onclick && openSec2Re.test(onclick)) {
+          const m = openSec2Re.exec(onclick);
+          if (m)
+            figurePagePath = m[1].replace(/&amp;/g, "&").trim() || undefined;
         }
-        return { parts, relatedLinkRowIndices };
-      },
-      OPTIONS_COL_1
-    )
+        if (!partNumber && !description) continue;
+        const hasRelated =
+          row.querySelector(`td:nth-child(${optionsCol}) img.relatedURL`) !=
+          null;
+        parts.push({
+          item: item || undefined,
+          partNumber,
+          description,
+          servicePartNumber: servicePartNumber || undefined,
+          requiredQuantity: requiredQuantity || undefined,
+          rowIndex: i,
+          figurePagePath,
+        });
+        if (hasRelated) relatedLinkRowIndices.push(i);
+      }
+      return { parts, relatedLinkRowIndices };
+    }, OPTIONS_COL_1)
     .catch(() => null);
 
   if (result && Array.isArray(result.parts)) {
     return result as { parts: PartRow[]; relatedLinkRowIndices: number[] };
   }
 
-  // Fallback: original per-row scraping if evaluate fails (e.g. different DOM)
-  const rows = await page.locator(oc.partsTable).locator('tbody tr').all();
+  const rows = await page.locator(oc.partsTable).locator("tbody tr").all();
   const rowsOut: PartRow[] = [];
   const relatedLinkRowIndices: number[] = [];
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]!;
-    const isEmptyCell = await row.locator('td.dataTables_empty').isVisible().catch(() => false);
+    const isEmptyCell = await row
+      .locator("td.dataTables_empty")
+      .isVisible()
+      .catch(() => false);
     if (isEmptyCell) continue;
-    const isHidden = await row.getAttribute('class').then((c) => (c || '').includes('group')).catch(() => false);
+    const isHidden = await row
+      .getAttribute("class")
+      .then((c) => (c || "").includes("group"))
+      .catch(() => false);
     if (isHidden) continue;
     const visible = await row.isVisible().catch(() => false);
     if (!visible) continue;
-    const tds = await row.locator('td').allTextContents();
+    const tds = await row.locator("td").allTextContents();
     if (tds.length < 4) continue;
-    const rowText = await row.innerText().catch(() => '');
+    const rowText = await row.innerText().catch(() => "");
     if (/no matching records found/i.test(rowText)) continue;
     const item = tds[1]?.trim();
-    const partNumCell = row.locator('td:nth-child(3)');
-    const linkEl = partNumCell.locator('a').first();
-    let partNumber = (await linkEl.innerText().catch(() => '')).trim();
-    if (!partNumber) partNumber = tds[2]?.trim() ?? '';
-    const figLinkEl = row.locator('td').last().locator('a[onclick*="openSec2"]').first();
-    let onclick = await figLinkEl.getAttribute('onclick').catch(() => null);
-    if (!onclick) onclick = await linkEl.getAttribute('onclick').catch(() => null);
+    const partNumCell = row.locator("td:nth-child(3)");
+    const linkEl = partNumCell.locator("a").first();
+    let partNumber = (await linkEl.innerText().catch(() => "")).trim();
+    if (!partNumber) partNumber = tds[2]?.trim() ?? "";
+    const figLinkEl = row
+      .locator("td")
+      .last()
+      .locator('a[onclick*="openSec2"]')
+      .first();
+    let onclick = await figLinkEl.getAttribute("onclick").catch(() => null);
+    if (!onclick)
+      onclick = await linkEl.getAttribute("onclick").catch(() => null);
     const figurePagePath = parseOpenSec2FigurePath(onclick);
-    const description = tds[3]?.trim() ?? '';
+    const description = tds[3]?.trim() ?? "";
     const servicePartNumber = tds[4]?.trim() || undefined;
     const requiredQuantity = tds.length > 6 ? tds[6]?.trim() : undefined;
     if (partNumber || description) {
@@ -326,7 +428,9 @@ async function scrapeAllTableRows(page: Page): Promise<{ parts: PartRow[]; relat
         rowIndex: i,
         figurePagePath,
       });
-      const relatedLink = row.locator(`td:nth-child(${OPTIONS_COL}) img.relatedURL`).first();
+      const relatedLink = row
+        .locator(`td:nth-child(${OPTIONS_COL}) img.relatedURL`)
+        .first();
       const hasLink = await relatedLink.isVisible().catch(() => false);
       if (hasLink) relatedLinkRowIndices.push(i);
     }
@@ -337,31 +441,45 @@ async function scrapeAllTableRows(page: Page): Promise<{ parts: PartRow[]; relat
 async function scrapeSearchTabTableRows(page: Page): Promise<PartRow[]> {
   const result = await page
     .evaluate(() => {
-      const rows = document.querySelectorAll('#partsTable tbody tr');
-      const parts: Array<{ partNumber: string; description: string; servicePartNumber?: string; requiredQuantity?: string; rowIndex: number; figurePagePath?: string }> = [];
+      const rows = document.querySelectorAll("#partsTable tbody tr");
+      const parts: Array<{
+        partNumber: string;
+        description: string;
+        servicePartNumber?: string;
+        requiredQuantity?: string;
+        rowIndex: number;
+        figurePagePath?: string;
+      }> = [];
       const openSec2Re = /openSec2\s*\(\s*'[^']*'\s*,\s*'([^']*)'/;
       for (let i = 0; i < rows.length; i++) {
         const row = rows[i] as HTMLTableRowElement;
-        if (row.classList.contains('group')) continue;
-        const empty = row.querySelector('td.dataTables_empty');
+        if (row.classList.contains("group")) continue;
+        const empty = row.querySelector("td.dataTables_empty");
         if (empty) continue;
-        const tds = row.querySelectorAll('td');
+        const tds = row.querySelectorAll("td");
         if (tds.length < 3) continue;
-        const rowText = row.innerText || '';
+        const rowText = row.innerText || "";
         if (/no matching records found/i.test(rowText)) continue;
         const partNumCell = tds[1];
-        const partLink = partNumCell?.querySelector('a');
-        const partNumber = (partLink?.textContent || (tds[1]?.textContent || '')).trim();
-        const description = (tds[2]?.textContent || '').trim();
-        const servicePartNumber = (tds[3]?.textContent || '').trim() || undefined;
-        const requiredQuantity = tds.length > 4 ? (tds[4]?.textContent || '').trim() : undefined;
+        const partLink = partNumCell?.querySelector("a");
+        const partNumber = (
+          partLink?.textContent ||
+          tds[1]?.textContent ||
+          ""
+        ).trim();
+        const description = (tds[2]?.textContent || "").trim();
+        const servicePartNumber =
+          (tds[3]?.textContent || "").trim() || undefined;
+        const requiredQuantity =
+          tds.length > 4 ? (tds[4]?.textContent || "").trim() : undefined;
         let figurePagePath = undefined;
         const lastCell = tds[tds.length - 1];
         const figLink = lastCell?.querySelector('a[onclick*="openSec2"]');
-        const onclick = (figLink || partLink)?.getAttribute('onclick');
+        const onclick = (figLink || partLink)?.getAttribute("onclick");
         if (onclick && openSec2Re.test(onclick)) {
           const m = openSec2Re.exec(onclick);
-          if (m) figurePagePath = m[1].replace(/&amp;/g, '&').trim() || undefined;
+          if (m)
+            figurePagePath = m[1].replace(/&amp;/g, "&").trim() || undefined;
         }
         if (!partNumber && !description) continue;
         parts.push({
@@ -385,7 +503,7 @@ function formatWordSearchForEitherOrBoth(query: string): string {
   if (!trimmed) return trimmed;
   const words = trimmed.split(/\s+/).filter(Boolean);
   if (words.length <= 1) return trimmed;
-  return words.map((w) => w.trim()).join(', ');
+  return words.map((w) => w.trim()).join(", ");
 }
 
 export async function findPartViaSearchTab(
@@ -394,7 +512,7 @@ export async function findPartViaSearchTab(
   onStatus?: (message: string) => void,
 ): Promise<{ parts: PartRow[]; noMatch: boolean }> {
   const status = (msg: string) => {
-    console.log('[part-search]', msg);
+    console.log("[part-search]", msg);
     onStatus?.(msg);
   };
   const q = query.trim();
@@ -404,87 +522,145 @@ export async function findPartViaSearchTab(
   const isMultiWord = words.length >= 2;
   const wordSearchQuery = isMultiWord ? formatWordSearchForEitherOrBoth(q) : q;
 
-  status('Moving to search page...');
+  status("Moving to search page...");
   const searchTab = page.locator(oc.searchTab).first();
-  await searchTab.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+  await searchTab.waitFor({ state: "visible", timeout: 10000 }).catch(() => {});
   await searchTab.click();
   await sleep(500);
 
   const wordSearch = page.locator(oc.wordSearch).first();
-  await wordSearch.waitFor({ state: 'visible', timeout: 8000 }).catch(() => {});
+  await wordSearch.waitFor({ state: "visible", timeout: 8000 }).catch(() => {});
   await wordSearch.fill(wordSearchQuery);
-  status(isMultiWord ? 'Writing words in search bar (either or both)...' : 'Writing in search bar...');
+  status(
+    isMultiWord
+      ? "Writing words in search bar (either or both)..."
+      : "Writing in search bar...",
+  );
   await page.locator(oc.wordSearchButton).first().click();
   await sleep(600);
 
   await waitForPartsTableReady(page);
-  status('Looking in table...');
+  status("Looking in table...");
   const filterInput = page.locator(oc.partsTableFilter).first();
-  await filterInput.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+  await filterInput
+    .waitFor({ state: "visible", timeout: 5000 })
+    .catch(() => {});
   let effectiveFilter: string;
   if (isMultiWord) {
-    effectiveFilter = '';
+    effectiveFilter = "";
   } else {
     await filterInput.fill(q);
     effectiveFilter = q;
   }
   await sleep(500);
 
-  const emptyCell = page.locator(oc.partsTable).locator('td.dataTables_empty').first();
+  const emptyCell = page
+    .locator(oc.partsTable)
+    .locator("td.dataTables_empty")
+    .first();
   const emptyVisible = await emptyCell.isVisible().catch(() => false);
   if (emptyVisible) {
-    const emptyText = await emptyCell.textContent().catch(() => '');
-    if (/no matching records found/i.test(emptyText ?? '')) {
+    const emptyText = await emptyCell.textContent().catch(() => "");
+    if (/no matching records found/i.test(emptyText ?? "")) {
       if (isMultiWord) {
-        status('No matches found for this record.');
+        status("No matches found for this record.");
         return { parts: [], noMatch: true };
       }
       if (words.length >= 2) {
-        status('No matches found. Trying another combination...');
+        status("No matches found. Trying another combination...");
         const firstHalf = words[0]!;
-        const secondHalf = words.slice(1).join(' ');
-        await filterInput.fill('');
+        const secondHalf = words.slice(1).join(" ");
+        await filterInput.fill("");
         await sleep(300);
-        status('Trying first part of query...');
+        status("Trying first part of query...");
         await filterInput.fill(firstHalf);
         await sleep(500);
-        const emptyFirst = await page.locator(oc.partsTable).locator('td.dataTables_empty').first().isVisible().catch(() => false);
-        const emptyFirstText = emptyFirst ? await page.locator(oc.partsTable).locator('td.dataTables_empty').first().textContent().catch(() => '') : '';
-        if (emptyFirst && /no matching records found/i.test(emptyFirstText ?? '')) {
-          status('No matches with first part. Trying second part...');
-          await filterInput.fill('');
+        const emptyFirst = await page
+          .locator(oc.partsTable)
+          .locator("td.dataTables_empty")
+          .first()
+          .isVisible()
+          .catch(() => false);
+        const emptyFirstText = emptyFirst
+          ? await page
+              .locator(oc.partsTable)
+              .locator("td.dataTables_empty")
+              .first()
+              .textContent()
+              .catch(() => "")
+          : "";
+        if (
+          emptyFirst &&
+          /no matching records found/i.test(emptyFirstText ?? "")
+        ) {
+          status("No matches with first part. Trying second part...");
+          await filterInput.fill("");
           await sleep(300);
           await filterInput.fill(secondHalf);
           await sleep(500);
-          const emptySecond = await page.locator(oc.partsTable).locator('td.dataTables_empty').first().isVisible().catch(() => false);
-          const emptySecondText = emptySecond ? await page.locator(oc.partsTable).locator('td.dataTables_empty').first().textContent().catch(() => '') : '';
-          if (emptySecond && /no matching records found/i.test(emptySecondText ?? '')) {
-            status('No matches found for this record.');
+          const emptySecond = await page
+            .locator(oc.partsTable)
+            .locator("td.dataTables_empty")
+            .first()
+            .isVisible()
+            .catch(() => false);
+          const emptySecondText = emptySecond
+            ? await page
+                .locator(oc.partsTable)
+                .locator("td.dataTables_empty")
+                .first()
+                .textContent()
+                .catch(() => "")
+            : "";
+          if (
+            emptySecond &&
+            /no matching records found/i.test(emptySecondText ?? "")
+          ) {
+            status("No matches found for this record.");
             return { parts: [], noMatch: true };
           }
           effectiveFilter = secondHalf;
-          status('Found results with second part of query.');
+          status("Found results with second part of query.");
         } else {
           effectiveFilter = firstHalf;
-          status('Found results with first part of query.');
+          status("Found results with first part of query.");
         }
       } else {
-        if (words.length === 1 && words[0]!.length > 1 && words[0]!.toLowerCase().endsWith('s')) {
+        if (
+          words.length === 1 &&
+          words[0]!.length > 1 &&
+          words[0]!.toLowerCase().endsWith("s")
+        ) {
           const singular = words[0]!.slice(0, -1);
-          status('No matches found. Trying singular...');
-          await filterInput.fill('');
+          status("No matches found. Trying singular...");
+          await filterInput.fill("");
           await sleep(300);
           await filterInput.fill(singular);
           await sleep(500);
-          const emptySingular = await page.locator(oc.partsTable).locator('td.dataTables_empty').first().isVisible().catch(() => false);
-          const emptySingularText = emptySingular ? await page.locator(oc.partsTable).locator('td.dataTables_empty').first().textContent().catch(() => '') : '';
-          if (emptySingular && /no matching records found/i.test(emptySingularText ?? '')) {
-            status('No matches found for this record.');
+          const emptySingular = await page
+            .locator(oc.partsTable)
+            .locator("td.dataTables_empty")
+            .first()
+            .isVisible()
+            .catch(() => false);
+          const emptySingularText = emptySingular
+            ? await page
+                .locator(oc.partsTable)
+                .locator("td.dataTables_empty")
+                .first()
+                .textContent()
+                .catch(() => "")
+            : "";
+          if (
+            emptySingular &&
+            /no matching records found/i.test(emptySingularText ?? "")
+          ) {
+            status("No matches found for this record.");
             return { parts: [], noMatch: true };
           }
           effectiveFilter = singular;
         } else {
-          status('No matches found for this record.');
+          status("No matches found for this record.");
           return { parts: [], noMatch: true };
         }
       }
@@ -507,11 +683,9 @@ export async function findPartViaSearchTab(
   let pageNum = 1;
   for (;;) {
     const pageParts = await scrapeSearchTabTableRows(page);
-    if (pageParts.length === 0 && pageNum === 1) return { parts: [], noMatch: false };
+    if (pageParts.length === 0 && pageNum === 1)
+      return { parts: [], noMatch: false };
     if (pageParts.length === 0) break;
-
-    // Add all rows from the table so the frontend can show them for user selection.
-    // AI suggestion (which part is most likely) is computed separately and shown as "Suggested by AI".
     addPicked(pageParts);
 
     if (!(await hasNextPartsTablePage(page))) break;
@@ -523,23 +697,18 @@ export async function findPartViaSearchTab(
     await sleep(400);
   }
 
-  const config = loadConfig();
-  await enrichPartsWithFigureImages(page, collectedParts, config, onStatus);
+  await enrichPartsFigureImages(page, collectedParts);
 
   return { parts: collectedParts, noMatch: false };
 }
 
-/**
- * On the same catalog search page, clear the search bar, type a new part name, run search and scrape results.
- * Use after findPartViaSearchTab for the first term when searching for multiple parts sequentially.
- */
 export async function searchAgainOnSamePage(
   page: Page,
   term: string,
   onStatus?: (message: string) => void,
 ): Promise<{ parts: PartRow[]; noMatch: boolean }> {
   const status = (msg: string) => {
-    console.log('[part-search]', msg);
+    console.log("[part-search]", msg);
     onStatus?.(msg);
   };
   const q = term.trim();
@@ -550,9 +719,9 @@ export async function searchAgainOnSamePage(
   const wordSearchQuery = isMultiWord ? formatWordSearchForEitherOrBoth(q) : q;
 
   const wordSearch = page.locator(oc.wordSearch).first();
-  await wordSearch.waitFor({ state: 'visible', timeout: 8000 }).catch(() => {});
-  status('Clearing search bar and searching for next part...');
-  await wordSearch.fill('');
+  await wordSearch.waitFor({ state: "visible", timeout: 8000 }).catch(() => {});
+  status("Clearing search bar and searching for next part...");
+  await wordSearch.fill("");
   await sleep(300);
   await wordSearch.fill(wordSearchQuery);
   await page.locator(oc.wordSearchButton).first().click();
@@ -560,19 +729,24 @@ export async function searchAgainOnSamePage(
 
   await waitForPartsTableReady(page);
   const filterInput = page.locator(oc.partsTableFilter).first();
-  await filterInput.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
-  const effectiveFilter = isMultiWord ? '' : q;
+  await filterInput
+    .waitFor({ state: "visible", timeout: 5000 })
+    .catch(() => {});
+  const effectiveFilter = isMultiWord ? "" : q;
   if (!isMultiWord) {
     await filterInput.fill(q);
   }
   await sleep(500);
 
-  const emptyCell = page.locator(oc.partsTable).locator('td.dataTables_empty').first();
+  const emptyCell = page
+    .locator(oc.partsTable)
+    .locator("td.dataTables_empty")
+    .first();
   const emptyVisible = await emptyCell.isVisible().catch(() => false);
   if (emptyVisible) {
-    const emptyText = await emptyCell.textContent().catch(() => '');
-    if (/no matching records found/i.test(emptyText ?? '')) {
-      status('No matches found for this part.');
+    const emptyText = await emptyCell.textContent().catch(() => "");
+    if (/no matching records found/i.test(emptyText ?? "")) {
+      status("No matches found for this part.");
       return { parts: [], noMatch: true };
     }
   }
@@ -592,7 +766,8 @@ export async function searchAgainOnSamePage(
   let pageNum = 1;
   for (;;) {
     const pageParts = await scrapeSearchTabTableRows(page);
-    if (pageParts.length === 0 && pageNum === 1) return { parts: [], noMatch: false };
+    if (pageParts.length === 0 && pageNum === 1)
+      return { parts: [], noMatch: false };
     if (pageParts.length === 0) break;
     addPicked(pageParts);
     if (!(await hasNextPartsTablePage(page))) break;
@@ -604,8 +779,7 @@ export async function searchAgainOnSamePage(
     await sleep(400);
   }
 
-  const config = loadConfig();
-  await enrichPartsWithFigureImages(page, collectedParts, config, onStatus);
+  await enrichPartsFigureImages(page, collectedParts);
 
   return { parts: collectedParts, noMatch: false };
 }
@@ -621,9 +795,14 @@ export type DetailListPreferredCategory = {
   subcategoryName?: string;
 };
 
-/** Filter is always filled with part number when searching for a selected part. */
-function getDetailListFilterValue(selectedPart: SelectedPartForDetailList): string {
-  return (selectedPart.partNumber && selectedPart.partNumber.trim()) || (selectedPart.description && selectedPart.description.trim()) || '';
+function getDetailListFilterValue(
+  selectedPart: SelectedPartForDetailList,
+): string {
+  return (
+    (selectedPart.partNumber && selectedPart.partNumber.trim()) ||
+    (selectedPart.description && selectedPart.description.trim()) ||
+    ""
+  );
 }
 
 export async function findPartInDetailListByDescription(
@@ -635,13 +814,13 @@ export async function findPartInDetailListByDescription(
   abortSignal?: AbortSignal,
 ): Promise<{ section: string; subcategory: string } | null> {
   const status = (msg: string) => {
-    console.log('[part-search]', msg);
+    console.log("[part-search]", msg);
     onStatus?.(msg);
   };
   const config = loadConfig();
   if (!preferred?.parentName && !config.openaiApiKey) return null;
   const referenceText = getReferenceTextForPromptAsync();
-  const partContext = `${selectedPart.description || ''} (Part #${selectedPart.partNumber})`;
+  const partContext = `${selectedPart.description || ""} (Part #${selectedPart.partNumber})`;
   const filterValue = getDetailListFilterValue(selectedPart);
   let triedParents = new Set(excludedParentNames.map((n) => normalize(n)));
 
@@ -649,11 +828,13 @@ export async function findPartInDetailListByDescription(
     if (abortSignal?.aborted) throw new ScraperCancelledError();
     let infos: NodeInfo[] = [];
     for (let r = 0; r < DETAIL_LIST_MAX_TREE_RETRIES; r++) {
-      infos = await getTreeNodes(page, DETAIL_LIST_TREE_WAIT_MS).catch(() => []);
+      infos = await getTreeNodes(page, DETAIL_LIST_TREE_WAIT_MS).catch(
+        () => [],
+      );
       const rootCategories = getRootCategories(infos);
       if (infos.length > 0 && rootCategories.length > 0) break;
       if (r < DETAIL_LIST_MAX_TREE_RETRIES - 1) {
-        status('Waiting for catalog tree...');
+        status("Waiting for catalog tree...");
         await sleep(DETAIL_LIST_RETRY_SLEEP_MS);
       }
     }
@@ -665,29 +846,51 @@ export async function findPartInDetailListByDescription(
     let categoryNode: NodeInfo | null;
 
     if (preferred?.parentName) {
-      categoryNode = rootCategories.find((r) => nodeTextMatches(r.text, preferred!.parentName)) ?? null;
+      categoryNode =
+        rootCategories.find((r) =>
+          nodeTextMatches(r.text, preferred!.parentName),
+        ) ?? null;
       if (!categoryNode) {
-        status(`Preferred category "${preferred.parentName}" not found in tree.`);
+        status(
+          `Preferred category "${preferred.parentName}" not found in tree.`,
+        );
         return null;
       }
       categoryName = categoryNode.text;
-      status(`Looking in category: ${categoryName}${preferred.subcategoryName ? ` > ${preferred.subcategoryName}` : ''}`);
+      status(
+        `Looking in category: ${categoryName}${preferred.subcategoryName ? ` > ${preferred.subcategoryName}` : ""}`,
+      );
       triedParents.add(normalize(categoryName));
     } else {
-      const availableNames = rootNames.filter((n) => !triedParents.has(normalize(n)));
+      const availableNames = rootNames.filter(
+        (n) => !triedParents.has(normalize(n)),
+      );
       if (availableNames.length === 0) return null;
       if (triedParents.size >= DETAIL_LIST_MAX_AI_PARENTS) {
-        status(`Part not found in any of ${DETAIL_LIST_MAX_AI_PARENTS} AI-suggested parent categories. Stopping.`);
+        status(
+          `Part not found in any of ${DETAIL_LIST_MAX_AI_PARENTS} AI-suggested parent categories. Stopping.`,
+        );
         return null;
       }
       const parentAttempt = triedParents.size + 1;
-      status(`AI flow: checking parent category ${parentAttempt} of ${DETAIL_LIST_MAX_AI_PARENTS}...`);
-      status('Asking AI which category contains this part...');
-      let aiCategoryName = await pickCategory(config.openaiApiKey, partContext, availableNames, referenceText);
+      status(
+        `AI flow: checking parent category ${parentAttempt} of ${DETAIL_LIST_MAX_AI_PARENTS}...`,
+      );
+      status("Asking AI which category contains this part...");
+      let aiCategoryName = await pickCategory(
+        config.openaiApiKey,
+        partContext,
+        availableNames,
+        referenceText,
+      );
       if (!aiCategoryName) aiCategoryName = availableNames[0] ?? null;
       if (!aiCategoryName) return null;
       const nameToMatch: string = aiCategoryName;
-      categoryNode = rootCategories.find((r) => nodeTextMatches(r.text, nameToMatch)) ?? rootCategories.find((r) => availableNames.includes(r.text)) ?? rootCategories[0] ?? null;
+      categoryNode =
+        rootCategories.find((r) => nodeTextMatches(r.text, nameToMatch)) ??
+        rootCategories.find((r) => availableNames.includes(r.text)) ??
+        rootCategories[0] ??
+        null;
       if (!categoryNode) return null;
       categoryName = categoryNode.text;
       status(`AI suggested category: "${categoryName}"`);
@@ -711,7 +914,9 @@ export async function findPartInDetailListByDescription(
       }
     }
     await sleep(300);
-    let freshInfos = await getTreeNodes(page, DETAIL_LIST_TREE_WAIT_MS).catch(() => infos);
+    let freshInfos = await getTreeNodes(page, DETAIL_LIST_TREE_WAIT_MS).catch(
+      () => infos,
+    );
     if (freshInfos.length === 0) freshInfos = infos;
     const children = getDirectChildren(freshInfos, matchIndex, matchIndent);
     if (children.length === 0) {
@@ -719,31 +924,39 @@ export async function findPartInDetailListByDescription(
       await loc.scrollIntoViewIfNeeded().catch(() => {});
       await sleep(200);
       await loc.click({ force: true });
-      status('Waiting for table...');
+      status("Waiting for table...");
       let tableReady = false;
-      for (let tr = 0; tr < DETAIL_LIST_MAX_TABLE_RETRIES && !tableReady; tr++) {
+      for (
+        let tr = 0;
+        tr < DETAIL_LIST_MAX_TABLE_RETRIES && !tableReady;
+        tr++
+      ) {
         try {
           await waitForDetailListTableAndFilter(page);
           tableReady = true;
         } catch {
-          if (tr < DETAIL_LIST_MAX_TABLE_RETRIES - 1) await sleep(DETAIL_LIST_RETRY_SLEEP_MS);
+          if (tr < DETAIL_LIST_MAX_TABLE_RETRIES - 1)
+            await sleep(DETAIL_LIST_RETRY_SLEEP_MS);
         }
       }
       if (!tableReady) {
         if (!preferred?.parentName) triedParents.add(normalize(categoryName));
         continue;
       }
-      const filterInput = page.locator('#partsTable_filter input').first();
-      status('Filling filter with part number...');
+      const filterInput = page.locator("#partsTable_filter input").first();
+      status("Filling filter with part number...");
       await filterInput.scrollIntoViewIfNeeded().catch(() => {});
       await filterInput.click();
       await filterInput.fill(filterValue);
       await sleep(500);
-      const emptyCell = page.locator(oc.partsTable).locator('td.dataTables_empty').first();
+      const emptyCell = page
+        .locator(oc.partsTable)
+        .locator("td.dataTables_empty")
+        .first();
       const emptyVisible = await emptyCell.isVisible().catch(() => false);
       if (emptyVisible) {
-        const emptyText = await emptyCell.textContent().catch(() => '');
-        if (/no matching records found/i.test(emptyText ?? '')) {
+        const emptyText = await emptyCell.textContent().catch(() => "");
+        if (/no matching records found/i.test(emptyText ?? "")) {
           if (preferred?.parentName) return null;
           continue;
         }
@@ -751,8 +964,12 @@ export async function findPartInDetailListByDescription(
       const { parts: tableParts } = await scrapeAllTableRows(page);
       const row = tableParts.find(
         (p) =>
-          (p.partNumber && normalize(p.partNumber) === normalize(selectedPart.partNumber)) ||
-          (selectedPart.servicePartNumber && p.servicePartNumber && normalize(p.servicePartNumber) === normalize(selectedPart.servicePartNumber)),
+          (p.partNumber &&
+            normalize(p.partNumber) === normalize(selectedPart.partNumber)) ||
+          (selectedPart.servicePartNumber &&
+            p.servicePartNumber &&
+            normalize(p.servicePartNumber) ===
+              normalize(selectedPart.servicePartNumber)),
       );
       if (row) return { section: categoryName, subcategory: categoryName };
       if (preferred?.parentName) return null;
@@ -763,12 +980,24 @@ export async function findPartInDetailListByDescription(
     const childNames = children.map((c) => c.text).filter(Boolean);
     const triedSubcats = new Set<string>();
 
-    if (preferred?.parentName && (preferred.subcategoryName || childNames.length > 0)) {
-      const toTryFirst = preferred.subcategoryName ? [preferred.subcategoryName] : [];
-      const orderToTry = [...new Set([...toTryFirst, ...childNames.filter((n) => !toTryFirst.includes(n))])];
+    if (
+      preferred?.parentName &&
+      (preferred.subcategoryName || childNames.length > 0)
+    ) {
+      const toTryFirst = preferred.subcategoryName
+        ? [preferred.subcategoryName]
+        : [];
+      const orderToTry = [
+        ...new Set([
+          ...toTryFirst,
+          ...childNames.filter((n) => !toTryFirst.includes(n)),
+        ]),
+      ];
       for (const nextSubcatName of orderToTry) {
         if (triedSubcats.has(normalize(nextSubcatName))) continue;
-        const childNode = children.find((c) => nodeTextMatches(c.text, nextSubcatName));
+        const childNode = children.find((c) =>
+          nodeTextMatches(c.text, nextSubcatName),
+        );
         if (!childNode) {
           triedSubcats.add(normalize(nextSubcatName));
           continue;
@@ -777,31 +1006,39 @@ export async function findPartInDetailListByDescription(
         await loc.scrollIntoViewIfNeeded().catch(() => {});
         await sleep(200);
         await loc.click({ force: true });
-        status('Waiting for table...');
+        status("Waiting for table...");
         let tableReady = false;
-        for (let tr = 0; tr < DETAIL_LIST_MAX_TABLE_RETRIES && !tableReady; tr++) {
+        for (
+          let tr = 0;
+          tr < DETAIL_LIST_MAX_TABLE_RETRIES && !tableReady;
+          tr++
+        ) {
           try {
             await waitForDetailListTableAndFilter(page);
             tableReady = true;
           } catch {
-            if (tr < DETAIL_LIST_MAX_TABLE_RETRIES - 1) await sleep(DETAIL_LIST_RETRY_SLEEP_MS);
+            if (tr < DETAIL_LIST_MAX_TABLE_RETRIES - 1)
+              await sleep(DETAIL_LIST_RETRY_SLEEP_MS);
           }
         }
         if (!tableReady) {
           triedSubcats.add(normalize(nextSubcatName));
           continue;
         }
-        const filterInput = page.locator('#partsTable_filter input').first();
-        status('Filling filter with part number...');
+        const filterInput = page.locator("#partsTable_filter input").first();
+        status("Filling filter with part number...");
         await filterInput.scrollIntoViewIfNeeded().catch(() => {});
         await filterInput.click();
         await filterInput.fill(filterValue);
         await sleep(500);
-        const emptyCell = page.locator(oc.partsTable).locator('td.dataTables_empty').first();
+        const emptyCell = page
+          .locator(oc.partsTable)
+          .locator("td.dataTables_empty")
+          .first();
         const emptyVisible = await emptyCell.isVisible().catch(() => false);
         if (emptyVisible) {
-          const emptyText = await emptyCell.textContent().catch(() => '');
-          if (/no matching records found/i.test(emptyText ?? '')) {
+          const emptyText = await emptyCell.textContent().catch(() => "");
+          if (/no matching records found/i.test(emptyText ?? "")) {
             triedSubcats.add(normalize(nextSubcatName));
             continue;
           }
@@ -809,8 +1046,12 @@ export async function findPartInDetailListByDescription(
         const { parts: tableParts } = await scrapeAllTableRows(page);
         const row = tableParts.find(
           (p) =>
-            (p.partNumber && normalize(p.partNumber) === normalize(selectedPart.partNumber)) ||
-            (selectedPart.servicePartNumber && p.servicePartNumber && normalize(p.servicePartNumber) === normalize(selectedPart.servicePartNumber)),
+            (p.partNumber &&
+              normalize(p.partNumber) === normalize(selectedPart.partNumber)) ||
+            (selectedPart.servicePartNumber &&
+              p.servicePartNumber &&
+              normalize(p.servicePartNumber) ===
+                normalize(selectedPart.servicePartNumber)),
         );
         if (row) return { section: categoryName, subcategory: nextSubcatName };
         triedSubcats.add(normalize(nextSubcatName));
@@ -822,15 +1063,19 @@ export async function findPartInDetailListByDescription(
 
     for (;;) {
       if (abortSignal?.aborted) throw new ScraperCancelledError();
-      const remaining = childNames.filter((n) => !triedSubcats.has(normalize(n)));
+      const remaining = childNames.filter(
+        (n) => !triedSubcats.has(normalize(n)),
+      );
       if (remaining.length === 0) {
         triedParents.add(normalize(categoryName));
         break;
       }
       if (triedSubcats.size > 0) {
-        status('Not found in this subcategory. Asking AI for next subcategory...');
+        status(
+          "Not found in this subcategory. Asking AI for next subcategory...",
+        );
       } else {
-        status('Asking AI which subcategory to open...');
+        status("Asking AI which subcategory to open...");
       }
       const excludedList = Array.from(triedSubcats);
       const nextSubcatName = await pickNextSubcategory(
@@ -844,7 +1089,9 @@ export async function findPartInDetailListByDescription(
         triedParents.add(normalize(categoryName));
         break;
       }
-      const childNode = children.find((c) => nodeTextMatches(c.text, nextSubcatName));
+      const childNode = children.find((c) =>
+        nodeTextMatches(c.text, nextSubcatName),
+      );
       if (!childNode) {
         triedSubcats.add(normalize(nextSubcatName));
         continue;
@@ -853,31 +1100,39 @@ export async function findPartInDetailListByDescription(
       await loc.scrollIntoViewIfNeeded().catch(() => {});
       await sleep(200);
       await loc.click({ force: true });
-      status('Waiting for table...');
+      status("Waiting for table...");
       let tableReady = false;
-      for (let tr = 0; tr < DETAIL_LIST_MAX_TABLE_RETRIES && !tableReady; tr++) {
+      for (
+        let tr = 0;
+        tr < DETAIL_LIST_MAX_TABLE_RETRIES && !tableReady;
+        tr++
+      ) {
         try {
           await waitForDetailListTableAndFilter(page);
           tableReady = true;
         } catch {
-          if (tr < DETAIL_LIST_MAX_TABLE_RETRIES - 1) await sleep(DETAIL_LIST_RETRY_SLEEP_MS);
+          if (tr < DETAIL_LIST_MAX_TABLE_RETRIES - 1)
+            await sleep(DETAIL_LIST_RETRY_SLEEP_MS);
         }
       }
       if (!tableReady) {
         triedSubcats.add(normalize(nextSubcatName));
         continue;
       }
-      const filterInput = page.locator('#partsTable_filter input').first();
-      status('Filling filter with part number...');
+      const filterInput = page.locator("#partsTable_filter input").first();
+      status("Filling filter with part number...");
       await filterInput.scrollIntoViewIfNeeded().catch(() => {});
       await filterInput.click();
       await filterInput.fill(filterValue);
       await sleep(500);
-      const emptyCell = page.locator(oc.partsTable).locator('td.dataTables_empty').first();
+      const emptyCell = page
+        .locator(oc.partsTable)
+        .locator("td.dataTables_empty")
+        .first();
       const emptyVisible = await emptyCell.isVisible().catch(() => false);
       if (emptyVisible) {
-        const emptyText = await emptyCell.textContent().catch(() => '');
-        if (/no matching records found/i.test(emptyText ?? '')) {
+        const emptyText = await emptyCell.textContent().catch(() => "");
+        if (/no matching records found/i.test(emptyText ?? "")) {
           triedSubcats.add(normalize(nextSubcatName));
           continue;
         }
@@ -885,8 +1140,12 @@ export async function findPartInDetailListByDescription(
       const { parts: tableParts } = await scrapeAllTableRows(page);
       const row = tableParts.find(
         (p) =>
-          (p.partNumber && normalize(p.partNumber) === normalize(selectedPart.partNumber)) ||
-          (selectedPart.servicePartNumber && p.servicePartNumber && normalize(p.servicePartNumber) === normalize(selectedPart.servicePartNumber)),
+          (p.partNumber &&
+            normalize(p.partNumber) === normalize(selectedPart.partNumber)) ||
+          (selectedPart.servicePartNumber &&
+            p.servicePartNumber &&
+            normalize(p.servicePartNumber) ===
+              normalize(selectedPart.servicePartNumber)),
       );
       if (row) return { section: categoryName, subcategory: nextSubcatName };
       triedSubcats.add(normalize(nextSubcatName));
@@ -901,10 +1160,10 @@ async function scrapeModalRelatedParts(page: Page): Promise<PartRow[]> {
   const rows = await page.locator(oc.partOptionsTableRows).all();
   const out: PartRow[] = [];
   for (const row of rows) {
-    const tds = await row.locator('td').allTextContents();
+    const tds = await row.locator("td").allTextContents();
     if (tds.length < 3) continue;
-    const partNumber = tds[1]?.trim() ?? '';
-    const description = tds[2]?.trim() ?? '';
+    const partNumber = tds[1]?.trim() ?? "";
+    const description = tds[2]?.trim() ?? "";
     if (partNumber || description) {
       out.push({ partNumber, description });
     }
@@ -912,16 +1171,17 @@ async function scrapeModalRelatedParts(page: Page): Promise<PartRow[]> {
   return out;
 }
 
-/** Returns true if the parts table has a next page (Next button not disabled). */
 async function hasNextPartsTablePage(page: Page): Promise<boolean> {
   const nextBtn = page.locator(oc.partsTablePaginateNext).first();
   const visible = await nextBtn.isVisible().catch(() => false);
   if (!visible) return false;
-  const disabled = await nextBtn.getAttribute('class').then((c) => (c || '').includes('disabled')).catch(() => true);
+  const disabled = await nextBtn
+    .getAttribute("class")
+    .then((c) => (c || "").includes("disabled"))
+    .catch(() => true);
   return !disabled;
 }
 
-/** Clicks the Next button on the parts table pagination. Returns true if click was performed. */
 async function goToNextPartsTablePage(page: Page): Promise<boolean> {
   if (!(await hasNextPartsTablePage(page))) return false;
   const nextBtn = page.locator(oc.partsTablePaginateNext).first();
@@ -932,32 +1192,34 @@ async function goToNextPartsTablePage(page: Page): Promise<boolean> {
   return true;
 }
 
-/** Gets current 1-based page number from parts table pagination (e.g. 1, 2, 3). */
 async function getCurrentPartsTablePageNumber(page: Page): Promise<number> {
   const currentBtn = page.locator(oc.partsTablePaginateCurrent).first();
-  const text = await currentBtn.textContent().catch(() => '1');
-  const n = parseInt((text ?? '1').trim(), 10);
+  const text = await currentBtn.textContent().catch(() => "1");
+  const n = parseInt((text ?? "1").trim(), 10);
   return Number.isFinite(n) ? n : 1;
 }
 
-/** AI-only flow: ask AI which parent category, open it, then ask AI which subcategory(ies), open those and pick table row(s). Returns parts and the navigation path used (for learning). */
 async function findPartInTreeAndScrapeTableForSegment(
   page: Page,
   segmentQuery: string,
-  onStatus?: (message: string) => void
+  onStatus?: (message: string) => void,
 ): Promise<{ parts: PartRow[]; category?: string; subcategories?: string[] }> {
-  const empty = { parts: [] as PartRow[], category: undefined as string | undefined, subcategories: undefined as string[] | undefined };
+  const empty = {
+    parts: [] as PartRow[],
+    category: undefined as string | undefined,
+    subcategories: undefined as string[] | undefined,
+  };
   const query = segmentQuery.trim();
   if (!query) return empty;
 
   const status = (msg: string) => {
-    console.log('[part-search]', msg);
+    console.log("[part-search]", msg);
     onStatus?.(msg);
   };
 
   const config = loadConfig();
   if (!config.openaiApiKey) {
-    status('OpenAI API key not set; cannot run AI-only part search.');
+    status("OpenAI API key not set; cannot run AI-only part search.");
     return empty;
   }
 
@@ -971,12 +1233,19 @@ async function findPartInTreeAndScrapeTableForSegment(
   if (rootCategories.length === 0) return empty;
 
   const rootNames = rootCategories.map((r) => r.text).filter(Boolean);
-  status('Asking AI which category contains this part...');
-  const categoryName = await pickCategory(config.openaiApiKey, query, rootNames, referenceText);
+  status("Asking AI which category contains this part...");
+  const categoryName = await pickCategory(
+    config.openaiApiKey,
+    query,
+    rootNames,
+    referenceText,
+  );
   if (!categoryName) return empty;
 
   status(`AI suggested category: "${categoryName}"`);
-  const categoryNode = rootCategories.find((r) => nodeTextMatches(r.text, categoryName));
+  const categoryNode = rootCategories.find((r) =>
+    nodeTextMatches(r.text, categoryName),
+  );
   if (!categoryNode) return empty;
 
   const matchIndex = categoryNode.index;
@@ -1008,7 +1277,7 @@ async function findPartInTreeAndScrapeTableForSegment(
   const seenKeys = new Set<string>();
 
   function addPart(p: PartRow): void {
-    const key = `${p.partNumber}|${p.description ?? ''}`;
+    const key = `${p.partNumber}|${p.description ?? ""}`;
     if (!seenKeys.has(key)) {
       seenKeys.add(key);
       parts.push(p);
@@ -1017,17 +1286,23 @@ async function findPartInTreeAndScrapeTableForSegment(
 
   async function scrapeTableForCurrentNode(): Promise<void> {
     await waitForPartsTableReady(page);
-    await page.locator(oc.partsTable).waitFor({ state: 'visible', timeout: TABLE_WAIT_MS }).catch(() => {});
+    await page
+      .locator(oc.partsTable)
+      .waitFor({ state: "visible", timeout: TABLE_WAIT_MS })
+      .catch(() => {});
 
     let currentPage = await getCurrentPartsTablePageNumber(page);
 
     while (true) {
-      const { parts: tableParts, relatedLinkRowIndices } = await scrapeAllTableRows(page);
+      const { parts: tableParts, relatedLinkRowIndices } =
+        await scrapeAllTableRows(page);
 
       if (tableParts.length === 0) {
         if (await hasNextPartsTablePage(page)) {
           const nextPage = currentPage + 1;
-          status(`Moving to page ${nextPage} — no matching entry on page ${currentPage}.`);
+          status(
+            `Moving to page ${nextPage} — no matching entry on page ${currentPage}.`,
+          );
           await goToNextPartsTablePage(page);
           currentPage = nextPage;
           continue;
@@ -1035,38 +1310,70 @@ async function findPartInTreeAndScrapeTableForSegment(
         break;
       }
 
-      status(currentPage === 1 ? 'Asking AI which row in the table best matches this part...' : `Asking AI which row on page ${currentPage} best matches this part...`);
+      status(
+        currentPage === 1
+          ? "Asking AI which row in the table best matches this part..."
+          : `Asking AI which row on page ${currentPage} best matches this part...`,
+      );
       const tableOptions: TableRowOption[] = tableParts.map((p) => ({
         partNumber: p.partNumber,
         description: p.description,
         item: p.item,
       }));
-      const pickedPartNumber = await pickTableRow(config.openaiApiKey, query, tableOptions, referenceText);
+      const pickedPartNumber = await pickTableRow(
+        config.openaiApiKey,
+        query,
+        tableOptions,
+        referenceText,
+      );
 
       if (pickedPartNumber) {
-        const row = tableParts.find((p) => p.partNumber === pickedPartNumber || p.partNumber.includes(pickedPartNumber) || pickedPartNumber.includes(p.partNumber));
+        const row = tableParts.find(
+          (p) =>
+            p.partNumber === pickedPartNumber ||
+            p.partNumber.includes(pickedPartNumber) ||
+            pickedPartNumber.includes(p.partNumber),
+        );
         if (row) {
           addPart(row);
           if (currentPage > 1) {
-            status(`AI suggested this row from the table (page ${currentPage}): Part #${row.partNumber} — ${row.description || '(no description)'}`);
+            status(
+              `AI suggested this row from the table (page ${currentPage}): Part #${row.partNumber} — ${row.description || "(no description)"}`,
+            );
           } else {
-            status(`AI suggested this row from the table: Part #${row.partNumber} — ${row.description || '(no description)'}`);
+            status(
+              `AI suggested this row from the table: Part #${row.partNumber} — ${row.description || "(no description)"}`,
+            );
           }
           const pickedRowIndex = row.rowIndex;
-          if (pickedRowIndex !== undefined && relatedLinkRowIndices.includes(pickedRowIndex)) {
-            const rowLocator = page.locator(oc.partsTable).locator('tbody tr').nth(pickedRowIndex);
-            const relatedLink = rowLocator.locator(`td:nth-child(${OPTIONS_COL}) img.relatedURL`).first();
+          if (
+            pickedRowIndex !== undefined &&
+            relatedLinkRowIndices.includes(pickedRowIndex)
+          ) {
+            const rowLocator = page
+              .locator(oc.partsTable)
+              .locator("tbody tr")
+              .nth(pickedRowIndex);
+            const relatedLink = rowLocator
+              .locator(`td:nth-child(${OPTIONS_COL}) img.relatedURL`)
+              .first();
             if (await relatedLink.isVisible().catch(() => false)) {
               await relatedLink.scrollIntoViewIfNeeded().catch(() => {});
               await sleep(100);
               await relatedLink.click({ force: true });
-              await page.waitForSelector(oc.partOptionsTable, { state: 'visible', timeout: MODAL_WAIT_MS }).catch(() => null);
+              await page
+                .waitForSelector(oc.partOptionsTable, {
+                  state: "visible",
+                  timeout: MODAL_WAIT_MS,
+                })
+                .catch(() => null);
               await sleep(200);
               const modalParts = await scrapeModalRelatedParts(page);
               modalParts.forEach(addPart);
               const closeBtn = page.locator(oc.partOptionsModalClose).first();
-              if (await closeBtn.isVisible().catch(() => false)) await closeBtn.click().catch(() => {});
-              else await page.keyboard.press('Escape');
+              if (await closeBtn.isVisible().catch(() => false))
+                await closeBtn.click().catch(() => {});
+              else await page.keyboard.press("Escape");
               await sleep(250);
             }
           }
@@ -1076,7 +1383,9 @@ async function findPartInTreeAndScrapeTableForSegment(
 
       if (await hasNextPartsTablePage(page)) {
         const nextPage = currentPage + 1;
-        status(`Moving to page ${nextPage} — no matching entry on page ${currentPage}.`);
+        status(
+          `Moving to page ${nextPage} — no matching entry on page ${currentPage}.`,
+        );
         await goToNextPartsTablePage(page);
         currentPage = nextPage;
       } else {
@@ -1094,12 +1403,20 @@ async function findPartInTreeAndScrapeTableForSegment(
     return { parts, category: categoryName, subcategories: undefined };
   }
 
-  status('Asking AI which subcategory(ies) to open...');
+  status("Asking AI which subcategory(ies) to open...");
   const childNames = children.map((c) => c.text).filter(Boolean);
-  const subcatNames = await pickSubcategories(config.openaiApiKey, query, childNames, referenceText);
-  if (subcatNames.length === 0) return { parts, category: categoryName, subcategories: [] };
+  const subcatNames = await pickSubcategories(
+    config.openaiApiKey,
+    query,
+    childNames,
+    referenceText,
+  );
+  if (subcatNames.length === 0)
+    return { parts, category: categoryName, subcategories: [] };
 
-  status(`AI suggested subcategory(ies): ${subcatNames.map((s) => `"${s}"`).join(', ')}`);
+  status(
+    `AI suggested subcategory(ies): ${subcatNames.map((s) => `"${s}"`).join(", ")}`,
+  );
   for (const subcatName of subcatNames) {
     const childNode = children.find((c) => nodeTextMatches(c.text, subcatName));
     if (!childNode) continue;
@@ -1114,30 +1431,34 @@ async function findPartInTreeAndScrapeTableForSegment(
   return { parts, category: categoryName, subcategories: subcatNames };
 }
 
-/** Extract part terms via AI when query has multiple parts; then run AI-only search per term. Merge and dedupe. */
 export async function findPartInTreeAndScrapeTable(
   page: Page,
   skuQuery: string,
-  onStatus?: (message: string) => void
+  onStatus?: (message: string) => void,
+  userRole?: "admin" | "internal" | "customer",
 ): Promise<PartRow[]> {
   const raw = skuQuery.trim();
   if (!raw) return [];
 
   const status = (msg: string) => {
-    console.log('[part-search]', msg);
+    console.log("[part-search]", msg);
     onStatus?.(msg);
   };
 
   const config = loadConfig();
-  const hasMultipleParts = /\s+and\s+/i.test(raw) || raw.includes(',');
+  const hasMultipleParts = /\s+and\s+/i.test(raw) || raw.includes(",");
   let queries: string[];
 
   if (hasMultipleParts && config.openaiApiKey) {
     const referenceText = getReferenceTextForPromptAsync();
-    const terms = await extractPartTermsFromQuery(config.openaiApiKey, raw, referenceText);
+    const terms = await extractPartTermsFromQuery(
+      config.openaiApiKey,
+      raw,
+      referenceText,
+    );
     queries = terms.length > 0 ? terms : [raw];
     if (queries.length > 1) {
-      const msg = `OpenAI extracted part terms: ${queries.map((q) => `"${q}"`).join(', ')}`;
+      const msg = `OpenAI extracted part terms: ${queries.map((q) => `"${q}"`).join(", ")}`;
       status(msg);
     }
   } else {
@@ -1148,29 +1469,33 @@ export async function findPartInTreeAndScrapeTable(
   const seenKeys = new Set<string>();
 
   for (const q of queries) {
-    const segmentResult = await findPartInTreeAndScrapeTableForSegment(page, q, onStatus);
+    const segmentResult = await findPartInTreeAndScrapeTableForSegment(
+      page,
+      q,
+      onStatus,
+    );
     const segmentParts = segmentResult.parts;
     for (const p of segmentParts) {
-      const key = `${p.partNumber}|${p.description ?? ''}`;
+      const key = `${p.partNumber}|${p.description ?? ""}`;
       if (!seenKeys.has(key)) {
         seenKeys.add(key);
         allParts.push(p);
       }
     }
     if (segmentParts.length > 0) {
-      const segmentAnswer = segmentParts.map((p) => p.partNumber).join(' and ');
+      const segmentAnswer = segmentParts.map((p) => p.partNumber).join(" and ");
       appendLearnedExample(q, segmentAnswer, {
         category: segmentResult.category,
         subcategories: segmentResult.subcategories,
-      });
+      }, userRole);
     }
   }
 
   if (allParts.length > 0) {
-    const answer = allParts.map((p) => p.partNumber).join(' and ');
-    appendLearnedExample(raw, answer);
+    const answer = allParts.map((p) => p.partNumber).join(" and ");
+    appendLearnedExample(raw, answer, undefined, userRole);
   }
 
-  status('Part search complete.');
+  status("Part search complete.");
   return allParts;
 }
